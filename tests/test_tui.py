@@ -1969,6 +1969,153 @@ class NewAuthorIndicator(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
                 TriageApp.NEW_AUTHOR_COLOUR, self.cell(app, "newcomer.mp3")
             )
 
+    async def test_accepting_an_audible_match_identifies_the_author(self) -> None:
+        # The flag has to clear as soon as the lookup settles the question.
+        # Waiting for a shelve run hours later means a restart still shows the
+        # author as new, which is exactly how this looks like a bug.
+        from forge.audible import AudibleMetadata
+        from forge.authors import AuthorRegistry, Contributor
+        from forge.tui.app import TriageApp
+
+        metadata = AudibleMetadata(
+            asin="B0DKPH5RT9",
+            title="New Book",
+            author="A Total Newcomer",
+            contributors=(Contributor("B0000NEW01", "A Total Newcomer"),),
+        )
+
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            app = pilot.app
+            self.assertIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(app, "newcomer.mp3")
+            )
+
+            app._learn_authors(metadata)
+            app.refresh_table()
+            await pilot.pause()
+
+            self.assertNotIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(app, "newcomer.mp3")
+            )
+
+        # ...and it is on disk, so a restart agrees.
+        with AuthorRegistry(self.cfg.authors_db_path) as registry:
+            self.assertEqual(registry.identity("a total newcomer"), "B0000NEW01")
+
+    async def test_the_flag_is_still_clear_after_a_restart(self) -> None:
+        from forge.audible import AudibleMetadata
+        from forge.authors import Contributor
+        from forge.tui.app import TriageApp
+
+        metadata = AudibleMetadata(
+            asin="B0DKPH5RT9",
+            author="A Total Newcomer",
+            contributors=(Contributor("B0000NEW01", "A Total Newcomer"),),
+        )
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            pilot.app._learn_authors(metadata)
+
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            self.assertNotIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(pilot.app, "newcomer.mp3")
+            )
+
+    async def test_a_role_credited_contributor_is_not_learned(self) -> None:
+        from forge.audible import AudibleMetadata
+        from forge.authors import AuthorRegistry, Contributor
+
+        metadata = AudibleMetadata(
+            author="A Total Newcomer",
+            contributors=(
+                Contributor("B0000NEW01", "A Total Newcomer"),
+                Contributor("B0000NEW02", "Some Person - translator"),
+            ),
+        )
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            pilot.app._learn_authors(metadata)
+
+        with AuthorRegistry(self.cfg.authors_db_path) as registry:
+            self.assertEqual(
+                [name for _, name, _ in registry.identities()], ["A Total Newcomer"]
+            )
+
+    async def test_a_match_with_no_contributor_asins_learns_nothing(self) -> None:
+        from forge.audible import AudibleMetadata
+
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            app = pilot.app
+            self.assertEqual(
+                app._learn_authors(AudibleMetadata(author="A Total Newcomer")), 0
+            )
+
+    async def test_learning_without_a_registry_is_harmless(self) -> None:
+        from forge.audible import AudibleMetadata
+        from forge.authors import Contributor
+
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            app = pilot.app
+            app._authors = None
+            self.assertEqual(
+                app._learn_authors(
+                    AudibleMetadata(contributors=(Contributor("B0000NEW01", "X"),))
+                ),
+                0,
+            )
+
+    async def test_the_whole_lookup_path_clears_the_flag(self) -> None:
+        # The reported sequence, driven through the real screens: `a`, pick the
+        # match, apply the tags, then reopen the app.
+        from forge.audible import AudibleMetadata
+        from forge.authors import Contributor
+        from forge.tui.app import TriageApp
+        from forge.tui.screens import AudibleScreen, CompareScreen
+
+        metadata = AudibleMetadata(
+            asin="B0DKPH5RT9",
+            title="New Book",
+            author="A Total Newcomer",
+            narrator="A Narrator",
+            contributors=(Contributor("B0000NEW01", "A Total Newcomer"),),
+        )
+
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            app = pilot.app
+            row = [b.display_name for b in app.shown].index("newcomer.mp3")
+            app.query_one("#books").move_cursor(row=row)
+            await pilot.pause()
+            self.assertIn(TriageApp.NEW_AUTHOR_COLOUR, self.cell(app, "newcomer.mp3"))
+
+            await pilot.press("a")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, AudibleScreen)
+
+            # What the second stage does once it has the full product.
+            app.screen.dismiss(metadata)
+            await pilot.pause()
+            self.assertIsInstance(app.screen, CompareScreen)
+
+            await pilot.press("ctrl+s")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertNotIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(app, "newcomer.mp3")
+            )
+
+        # Restarted: the identity came from the database, not from memory.
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            self.assertNotIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(pilot.app, "newcomer.mp3")
+            )
+
     async def test_the_filter_shows_only_unidentified_authors(self) -> None:
         self.learn()
         async with self.app().run_test() as pilot:

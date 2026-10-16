@@ -85,6 +85,10 @@ class AudibleMetadata:
     #: Runtime in seconds.  Used for match confidence only, never written.
     duration: int | None = None
     explicit: bool | None = None
+    #: The authors with the ASIN Audible identifies each one by.  Never written
+    #: to a tag: it is what the author registry learns an identity from, so
+    #: accepting a lookup in triage settles who the author is.
+    contributors: tuple["Contributor", ...] = ()
 
     def to_updates(self) -> dict[str, Any]:
         """The subset of fields that are written to tags.
@@ -276,8 +280,6 @@ class AudibleClient:
         "J.N. Chaney" and "J. N. Chaney" - while the ASIN never does.
         """
 
-        from .authors import Contributor
-
         checked = validate_asin(asin)
         payload = self._get(
             f"/1.0/catalog/products/{checked}", {"response_groups": "contributors"}
@@ -286,16 +288,7 @@ class AudibleClient:
         if not isinstance(product, dict):
             raise AudibleError(f"Audible returned no product for {checked}")
 
-        found: list[Contributor] = []
-        for entry in product.get("authors") or []:
-            if not isinstance(entry, dict):
-                continue
-            name = str(entry.get("name") or "").strip()
-            author_asin = str(entry.get("asin") or "").strip()
-            # A name with no ASIN carries no identity, so it is no use here.
-            if name and author_asin:
-                found.append(Contributor(asin=author_asin, name=name))
-        return tuple(found)
+        return _contributors(product.get("authors"))
 
     def search_url(self, *, title: str, author: str | None = None) -> str:
         keywords = f"{author} {clean_search_title(title)}".strip() if author else clean_search_title(title)
@@ -390,6 +383,7 @@ def normalize_product(product: dict[str, Any]) -> AudibleMetadata:
         cover_url=_cover(product),
         duration=runtime_minutes * 60 if runtime_minutes else None,
         explicit=_as_bool(product.get("is_adult_product")),
+        contributors=_contributors(product.get("authors")),
     )
 
 
@@ -421,6 +415,28 @@ def rank_by_runtime(results: list[SearchResult], source_seconds: float | None) -
         return (1, 0) if delta is None else (0, delta)
 
     return sorted(results, key=key)
+
+
+def _contributors(value: Any) -> tuple["Contributor", ...]:
+    """Authors as (ASIN, name) pairs, for identity rather than for display.
+
+    A name with no ASIN carries no identity, so it is dropped here - it still
+    reaches the tags through :func:`_names`.
+    """
+
+    from .authors import Contributor
+
+    if not isinstance(value, list):
+        return ()
+    found: list[Contributor] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        asin = str(entry.get("asin") or "").strip()
+        if name and asin:
+            found.append(Contributor(asin=asin, name=name))
+    return tuple(found)
 
 
 def _names(value: Any) -> str | None:

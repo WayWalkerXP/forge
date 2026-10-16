@@ -236,12 +236,16 @@ changing it is free — so a name forge cannot place is coloured rather than
 silently accepted. `f` cycles to a `new-author` filter that narrows the list to
 exactly those books.
 
-An Audible lookup does **not** clear the flag. That is deliberate: a lookup is
-one of the ways a brand-new author arrives, so it is precisely when a second
-look is worth having. The flag clears when `shelve` identifies the author, or
-when you identify them yourself with `forge authors --link`. The colour is
-advisory: if the registry cannot be opened at all, the list behaves exactly as
-it did before any of this existed.
+Accepting an Audible match clears the flag, because that lookup is what settles
+the question: the product carries Audible's contributor ASINs, so the author is
+identified the moment you apply the tags rather than hours later when `shelve`
+gets to it. The flag also clears when shelving identifies an author, or when you
+do it yourself with `forge authors --link`. What stays flagged is an author
+forge has no identity for — a hand-typed name, or a book with no ASIN — which is
+the case worth a second look.
+
+The colour is advisory: if the registry cannot be opened at all, the list
+behaves exactly as it did before any of this existed.
 
 When the registry knows the author but the tag spells them differently, the
 panel says `⇒ shelves as J. N. Chaney` instead, since nothing needs checking —

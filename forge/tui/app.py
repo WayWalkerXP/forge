@@ -36,7 +36,7 @@ from ..disposition import Disposition
 from ..errors import ForgeError
 from ..history import History
 from ..scan import Book, scan
-from ..shelve import clean_author
+from ..shelve import clean_author, is_role_credit
 from ..sorting import DEFAULT_ORDER, order_by_name, sort_books
 from .markup import literal as escape
 from .screens import (
@@ -360,6 +360,32 @@ class TriageApp(App[int]):
 
         self._author_cache[raw] = state
         return state
+
+    def _learn_authors(self, metadata: Any) -> int:
+        """Record the identities an accepted Audible match brings with it."""
+
+        if self._authors is None:
+            return 0
+        contributors = [
+            c for c in getattr(metadata, "contributors", ()) or () if not is_role_credit(c.name)
+        ]
+        if not contributors:
+            return 0
+        try:
+            learned = self._authors.learn(contributors)
+        except Exception:
+            # The registry is advisory; failing to write it must not cost the
+            # tag write that follows.
+            LOGGER.debug("could not record author identities", exc_info=True)
+            return 0
+        self._author_cache.clear()
+        if learned:
+            LOGGER.debug(
+                "learned %s author spelling(s): %s",
+                learned,
+                ", ".join(c.name for c in contributors),
+            )
+        return learned
 
     def _author_cell(self, book: Book) -> str:
         """The author column: coloured when it is one forge has not seen."""
@@ -1050,10 +1076,17 @@ class TriageApp(App[int]):
                 return
 
             def apply(updates: dict | None) -> None:
-                if updates:
-                    self._write_tags(
-                        book, updates, source="audible", description=f"ASIN {metadata.asin}"
-                    )
+                if not updates:
+                    return
+                # Accepting a match settles who the author is: the metadata
+                # carries Audible's contributor ASINs, which is the one thing
+                # that identifies an author across spellings.  Learn it here so
+                # the new-author flag clears, rather than waiting for a shelve
+                # run hours later to discover what this screen already knew.
+                self._learn_authors(metadata)
+                self._write_tags(
+                    book, updates, source="audible", description=f"ASIN {metadata.asin}"
+                )
 
             self.push_screen(
                 CompareScreen(
