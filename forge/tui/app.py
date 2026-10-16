@@ -27,6 +27,7 @@ from textual.css.query import NoMatches
 from textual.widgets import DataTable, Footer, Header, Input, Static
 from textual.worker import NoActiveWorker, Worker, WorkerState, get_current_worker
 
+from .. import authors as authors_mod
 from .. import disposition as disposition_mod
 from .. import library as library_mod
 from .. import tags as tags_mod
@@ -35,6 +36,7 @@ from ..disposition import Disposition
 from ..errors import ForgeError
 from ..history import History
 from ..scan import Book, scan
+from ..shelve import clean_author
 from ..sorting import DEFAULT_ORDER, order_by_name, sort_books
 from .markup import literal as escape
 from .screens import (
@@ -67,6 +69,7 @@ _FILTERS: tuple[tuple[str, str], ...] = (
     ("blocked", "not ready to convert"),
     ("ready", "tagged and ready"),
     ("duplicate", "already in the Audiobookshelf library"),
+    ("new-author", "an author forge has not identified before"),
 )
 
 _DUPLICATE_COLOUR = {
@@ -257,6 +260,13 @@ class TriageApp(App[int]):
         self.sort_name = DEFAULT_ORDER.name
         self.sort_descending = False
         self.sub_title = str(root)
+        #: The author identity registry, opened read-only for the indicator.
+        #: None when it could not be opened: an advisory colour must never be
+        #: the thing that stops triage running.
+        self._authors: authors_mod.AuthorRegistry | None = None
+        #: Author state by the raw tag string, since many books share an
+        #: author.  Cleared on every refresh so a lookup shows up at once.
+        self._author_cache: dict[str, tuple[str, str | None]] = {}
         #: Books marked for a batch action, by key rather than by row: a mark
         #: has to survive a re-sort, a filter change and a rescan.
         self.marked: set[str] = set()
@@ -291,8 +301,77 @@ class TriageApp(App[int]):
 
     def on_mount(self) -> None:
         self._ui_thread = threading.get_ident()
+        self._authors = self._open_author_registry()
         self.query_one("#books", DataTable).focus()
         self.load_books()
+
+    def on_unmount(self) -> None:
+        if self._authors is not None:
+            self._authors.close()
+            self._authors = None
+
+    def _open_author_registry(self) -> authors_mod.AuthorRegistry | None:
+        try:
+            return authors_mod.AuthorRegistry(self.config.authors_db_path)
+        except Exception:
+            LOGGER.debug("could not open the author registry", exc_info=True)
+            return None
+
+    # --------------------------------------------------------- author state #
+
+    #: An author forge has never identified.  Shown in the list in this colour
+    #: because the spelling is about to become a shelf in the library and an
+    #: Audiobookshelf author, and this is the last point at which it is cheap
+    #: to fix.
+    NEW_AUTHOR_COLOUR = "yellow"
+
+    AUTHOR_NEW = "new"
+    AUTHOR_RENAME = "rename"
+    AUTHOR_KNOWN = "known"
+    AUTHOR_NONE = "none"
+
+    def author_state(self, book: Book) -> tuple[str, str | None]:
+        """What the registry makes of this book's author.
+
+        Returns one of AUTHOR_NEW (never seen), AUTHOR_RENAME (known, but the
+        tag says something else and shelving will rewrite it), AUTHOR_KNOWN or
+        AUTHOR_NONE, with the canonical spelling when there is one.
+
+        Role credits are stripped first, so "Mary Smith - Translator" is judged
+        on the name shelving will actually use.
+        """
+
+        raw = book.author or ""
+        if not raw.strip():
+            return self.AUTHOR_NONE, None
+        if self._authors is None:
+            return self.AUTHOR_KNOWN, None
+        if raw in self._author_cache:
+            return self._author_cache[raw]
+
+        cleaned = clean_author(raw)
+        resolution = self._authors.resolve(cleaned)
+        if resolution.unknown:
+            state: tuple[str, str | None] = (self.AUTHOR_NEW, None)
+        elif resolution.canonical:
+            state = (self.AUTHOR_RENAME, resolution.canonical)
+        else:
+            state = (self.AUTHOR_KNOWN, cleaned)
+
+        self._author_cache[raw] = state
+        return state
+
+    def _author_cell(self, book: Book) -> str:
+        """The author column: coloured when it is one forge has not seen."""
+
+        if not book.author:
+            return "[dim]—[/dim]"
+
+        state, _ = self.author_state(book)
+        text = escape(book.author)[:22]
+        if state == self.AUTHOR_NEW:
+            return f"[{self.NEW_AUTHOR_COLOUR}]{text}[/{self.NEW_AUTHOR_COLOUR}]"
+        return text
 
     # ------------------------------------------------------------ activity #
 
@@ -413,6 +492,8 @@ class TriageApp(App[int]):
             check = self.duplicates.get(book.key)
             if check is None or not check.is_duplicate:
                 return False
+        if name == "new-author" and self.author_state(book)[0] != self.AUTHOR_NEW:
+            return False
 
         if not self.search_text:
             return True
@@ -431,6 +512,9 @@ class TriageApp(App[int]):
             return
         previous = table.cursor_row
         table.clear()
+        # Rebuilt from the registry each time, so an identity learned since the
+        # last refresh stops being flagged.
+        self._author_cache.clear()
 
         self.shown = sort_books(
             [book for book in self.books if self._matches(book)],
@@ -468,7 +552,7 @@ class TriageApp(App[int]):
             ready,
             (escape(book.title) if book.title else f"[dim]{escape(book.display_name)}[/dim]")[:38]
             + folder,
-            (escape(book.author) if book.author else "[dim]—[/dim]")[:22],
+            self._author_cell(book),
             (escape(meta.series) if meta and meta.series else "[dim]—[/dim]")[:20],
             (escape(meta.series_sequence) if meta and meta.series_sequence else "[dim]—[/dim]"),
             (escape(meta.asin) if meta and meta.asin else "[dim]—[/dim]"),
@@ -559,6 +643,19 @@ class TriageApp(App[int]):
             )
             colour = "yellow" if target.declined else "green"
             lines.append(f"  [{colour}]→ {target.rationale}[/{colour}]")
+
+        state, canonical = self.author_state(book)
+        if state == self.AUTHOR_NEW:
+            lines.append(
+                f"  [{self.NEW_AUTHOR_COLOUR}]★ new author: "
+                f"{escape(book.author or '')}[/{self.NEW_AUTHOR_COLOUR}]\n"
+                f"    [dim]forge has not identified this author before, so this "
+                f"spelling becomes a shelf in the library[/dim]"
+            )
+        elif state == self.AUTHOR_RENAME and canonical:
+            lines.append(
+                f"  [dim]⇒ shelves as {escape(canonical)}[/dim]"
+            )
 
         check = self.duplicates.get(book.key)
         if check is not None and check.status != library_mod.NO_ASIN:
@@ -1056,6 +1153,11 @@ class TriageApp(App[int]):
     @on(Input.Submitted, "#search")
     def _search_submitted(self) -> None:
         self.query_one("#books", DataTable).focus()
+
+    def filter_name(self) -> str:
+        """The active filter's name.  For the status line and for tests."""
+
+        return _FILTERS[self.filter_index][0]
 
     def action_cycle_filter(self) -> None:
         self.filter_index = (self.filter_index + 1) % len(_FILTERS)

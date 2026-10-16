@@ -109,7 +109,7 @@ database stores a hash and a size, not the image.
 | `d` | check this book against the Audiobookshelf library |
 | `D` | check every book that has an ASIN |
 | `/` | search title, author, series or ASIN |
-| `f` | cycle filters (all / untriaged / attention / blocked / ready / duplicate) |
+| `f` | cycle filters (all / untriaged / attention / blocked / ready / duplicate / new-author) |
 | `s` | sort the list |
 | `r` | rescan |
 | `q` | quit (waits for anything still running) |
@@ -227,6 +227,25 @@ Collaborations get one shelf per line-up, order-insensitively: a book tagged
 folder rather than starting a fourth spelling of the same partnership. The
 billing order in the tag is left as Audible gives it, because that is
 information.
+
+Triage flags an author forge has never identified: the name shows **yellow** in
+the `author` column, and the detail panel says `★ new author … this spelling
+becomes a shelf in the library`. The spelling in that tag is about to become a
+folder and an Audiobookshelf author, and triage is the last point at which
+changing it is free — so a name forge cannot place is coloured rather than
+silently accepted. `f` cycles to a `new-author` filter that narrows the list to
+exactly those books.
+
+An Audible lookup does **not** clear the flag. That is deliberate: a lookup is
+one of the ways a brand-new author arrives, so it is precisely when a second
+look is worth having. The flag clears when `shelve` identifies the author, or
+when you identify them yourself with `forge authors --link`. The colour is
+advisory: if the registry cannot be opened at all, the list behaves exactly as
+it did before any of this existed.
+
+When the registry knows the author but the tag spells them differently, the
+panel says `⇒ shelves as J. N. Chaney` instead, since nothing needs checking —
+that rewrite is the mechanism working.
 
 | command | what it does |
 |---|---|

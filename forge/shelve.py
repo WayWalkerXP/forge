@@ -210,6 +210,17 @@ def format_series_part(value: object) -> str:
         return text
 
 
+def is_role_credit(name: str) -> bool:
+    """True when a contributor name is a credit rather than an author.
+
+    "Basil Creighton - Translator", "David Chadwick - editor", or the bare
+    word "translator" left behind by a comma-separated credit.
+    """
+
+    entry = name.strip()
+    return bool(ROLE_SUFFIX_RE.search(entry) or BARE_ROLE_RE.match(entry))
+
+
 def clean_author(value: str | None) -> str:
     """Drop role-credited contributors and split "X aka Y" into both authors.
 
@@ -225,7 +236,7 @@ def clean_author(value: str | None) -> str:
         entry = entry.strip()
         if not entry:
             continue
-        if ROLE_SUFFIX_RE.search(entry) or BARE_ROLE_RE.match(entry):
+        if is_role_credit(entry):
             continue
         for name in AKA_RE.split(entry):
             name = name.strip()
@@ -594,6 +605,13 @@ def learn_identities(
             continue
 
         looked_up += 1
+        # Audible lists role-credited contributors as authors, ASIN and all
+        # ("David Chadwick - editor").  An identity for one could never be
+        # used, because clean_author drops those names before anything is
+        # resolved, so learning it would only clutter the registry.
+        contributors = tuple(
+            c for c in contributors if not is_role_credit(c.name)
+        )
         if not contributors:
             registry.note_unknown(names)
             continue

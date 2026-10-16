@@ -590,6 +590,29 @@ class LearningIdentities(ShelveCase):
         self.assertEqual(registry.canonical_name("Brandon Q. Morris"), "Brandon Q. Morris")
         self.assertEqual(registry.unknown_names(), [("Brandon Morris", 1)])
 
+    def test_a_role_credited_contributor_is_not_learned(self) -> None:
+        # Audible really does return these as authors, ASIN and all; shelving
+        # strips the name before resolving, so an identity for it is useless.
+        from forge.authors import Contributor
+
+        path = self.book(
+            "book.m4b", author="Shunryu Suzuki", album="A Book", asin="B0DKPH5RT9"
+        )
+        registry = self.registry()
+        audible = self.FakeAudible(
+            answers={
+                "B0DKPH5RT9": (
+                    Contributor("B000AP88YU", "Shunryu Suzuki"),
+                    Contributor("B000APNOB2", "David Chadwick - editor"),
+                )
+            }
+        )
+        shelve_mod.learn_identities([path], registry, audible)
+
+        self.assertEqual(
+            [name for _, name, _ in registry.identities()], ["Shunryu Suzuki"]
+        )
+
     def test_with_no_audible_client_nothing_is_invented(self) -> None:
         path = self.book("book.m4b", author="A Newcomer", album="A Book", asin="B0DKPH5RT9")
         registry = self.registry()

@@ -1826,6 +1826,182 @@ def asyncio_run(coro):
 
 @requires_ffmpeg
 @requires_textual
+class NewAuthorIndicator(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
+    """An author forge has never identified is flagged in the list.
+
+    The spelling in the tag is about to become a folder in the library and an
+    author in Audiobookshelf, and triage is the last point at which fixing it
+    is cheap - so a name forge cannot place is coloured rather than silently
+    accepted.
+    """
+
+    CHANEY = "B00W2ZAK7E"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg = config_mod.load(write_config(self.root))
+
+        self.known = self.cfg.source_dir / "known.mp3"
+        copy_mp3(self.known, seconds=1)
+        tags.write_metadata(self.known, {"author": "J.N. Chaney", "album": "Known Book"})
+
+        self.newcomer = self.cfg.source_dir / "newcomer.mp3"
+        copy_mp3(self.newcomer, seconds=1)
+        tags.write_metadata(
+            self.newcomer, {"author": "A Total Newcomer", "album": "New Book"}
+        )
+
+    def app(self):
+        from forge.tui.app import TriageApp
+
+        return TriageApp(self.cfg, self.cfg.source_dir)
+
+    def learn(self, name: str = "J.N. Chaney", asin: str | None = None) -> None:
+        from forge.authors import AuthorRegistry, Contributor
+
+        with AuthorRegistry(self.cfg.authors_db_path) as registry:
+            registry.learn([Contributor(asin or self.CHANEY, name)])
+
+    def cell(self, app, display_name: str, column: int = 4) -> str:
+        """One rendered cell, by book name.  Column 4 is the author."""
+
+        row = [b.display_name for b in app.shown].index(display_name)
+        return str(app.query_one("#books").get_row_at(row)[column])
+
+    async def settled(self, pilot):
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+
+    async def test_an_unknown_author_is_coloured(self) -> None:
+        from forge.tui.app import TriageApp
+
+        self.learn()
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            flagged = self.cell(pilot.app, "newcomer.mp3")
+            self.assertIn(TriageApp.NEW_AUTHOR_COLOUR, flagged)
+            self.assertIn("A Total Newcomer", flagged)
+
+    async def test_a_known_author_is_not(self) -> None:
+        from forge.tui.app import TriageApp
+
+        self.learn()
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            self.assertNotIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(pilot.app, "known.mp3")
+            )
+
+    async def test_a_spelling_variant_counts_as_known(self) -> None:
+        from forge.tui.app import TriageApp
+
+        # The whole point of the registry: "JN Chaney" is the same person.
+        self.learn(name="JN Chaney")
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            self.assertNotIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(pilot.app, "known.mp3")
+            )
+
+    async def test_role_credits_are_stripped_before_judging(self) -> None:
+        from forge.tui.app import TriageApp
+
+        self.learn()
+        credited = self.cfg.source_dir / "credited.mp3"
+        copy_mp3(credited, seconds=1)
+        tags.write_metadata(
+            credited,
+            {"author": "J.N. Chaney, Someone - translator", "album": "Credited"},
+        )
+
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            self.assertNotIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(pilot.app, "credited.mp3")
+            )
+
+    async def test_the_detail_panel_says_what_the_colour_means(self) -> None:
+        from textual.widgets import Static
+
+        self.learn()
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            app = pilot.app
+            row = [b.display_name for b in app.shown].index("newcomer.mp3")
+            app.query_one("#books").move_cursor(row=row)
+            await pilot.pause()
+
+            rendered = str(app.query_one("#detail", Static).renderable)
+            self.assertIn("new author", rendered)
+            self.assertIn("A Total Newcomer", rendered)
+
+    async def test_the_panel_says_when_shelving_will_rewrite_the_name(self) -> None:
+        from textual.widgets import Static
+
+        self.learn(name="J. N. Chaney")  # canonical differs from the tag
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            app = pilot.app
+            row = [b.display_name for b in app.shown].index("known.mp3")
+            app.query_one("#books").move_cursor(row=row)
+            await pilot.pause()
+
+            self.assertIn(
+                "shelves as J. N. Chaney",
+                str(app.query_one("#detail", Static).renderable),
+            )
+
+    async def test_learning_an_identity_clears_the_flag_on_refresh(self) -> None:
+        from forge.tui.app import TriageApp
+
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            app = pilot.app
+            self.assertIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(app, "newcomer.mp3")
+            )
+
+            self.learn(name="A Total Newcomer", asin="B000000001")
+            app.refresh_table()
+            await pilot.pause()
+
+            self.assertNotIn(
+                TriageApp.NEW_AUTHOR_COLOUR, self.cell(app, "newcomer.mp3")
+            )
+
+    async def test_the_filter_shows_only_unidentified_authors(self) -> None:
+        self.learn()
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            app = pilot.app
+            while app.filter_name() != "new-author":
+                await pilot.press("f")
+                await pilot.pause()
+
+            self.assertEqual(
+                [b.display_name for b in app.shown], ["newcomer.mp3"]
+            )
+
+    async def test_an_unopenable_registry_flags_nothing(self) -> None:
+        from forge.tui.app import TriageApp
+
+        # Advisory colour, never a dependency: with no registry the list is
+        # exactly what it was before any of this existed.
+        async with self.app().run_test() as pilot:
+            await self.settled(pilot)
+            app = pilot.app
+            app._authors = None
+            app.refresh_table()
+            await pilot.pause()
+
+            for name in ("known.mp3", "newcomer.mp3"):
+                self.assertNotIn(
+                    TriageApp.NEW_AUTHOR_COLOUR, self.cell(app, name), name
+                )
+
+
+@requires_ffmpeg
+@requires_textual
 class Quitting(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
     """Quitting must not abandon a file operation.
 
