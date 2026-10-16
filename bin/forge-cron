@@ -54,10 +54,18 @@ fi
 # Shelving runs even when the conversion had failures: the books that did
 # convert should still reach the library, and a book that failed was left where
 # it was with its disposition intact.
+#
+# --no-settle, and only here. The age check exists for the *source* directory,
+# where a book may still be downloading; the output directory is written by
+# forge alone. Without it, every book the run above had just finished was
+# younger than min_age_seconds and got deferred to the following night - 29 of
+# 73 on 2026-10-16. A conversion still in flight is skipped on its name
+# (`.tmp.m4b`) whatever this flag says, and both stages share one lock, so
+# nothing else can be writing there.
 if [ "${shelve_stage}" -eq 1 ]; then
     echo
     echo "=== forge shelve starting: $(date '+%Y-%m-%d %H:%M:%S') ==="
-    "${FORGE_DIR}/bin/forge" shelve --plain
+    "${FORGE_DIR}/bin/forge" shelve --plain --no-settle
     status=$?
     describe shelve "${status}"
     note "${status}"
