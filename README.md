@@ -223,7 +223,7 @@ without them. Put them in `[audiobookshelf]` in the config, or keep them out of
 the config file and in a `.env` instead:
 
 ```
-AUDIOBOOKSHELF_URL = "http://10.0.0.33:13378"
+AUDIOBOOKSHELF_URL = "http://audiobookshelf.lan:13378"
 AUDIOBOOKSHELF_API_KEY = "…"
 AUDIOBOOKSHELF_LIBRARY_ID = "…"     # optional; without it, every book library is indexed
 ```
@@ -246,7 +246,7 @@ forge run --dry-run                        # plan only
 timestamps and exit-code reporting for each stage.
 
 ```
-30 2 * * * /home/jrussell/scripts/forge/bin/forge-cron >> /home/jrussell/scripts/forge/cron.log 2>&1
+30 2 * * * /path/to/forge/bin/forge-cron >> /path/to/forge/cron.log 2>&1
 ```
 
 Pass `--no-shelve` to convert only, or `--shelve-only` to file books that are
