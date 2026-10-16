@@ -277,6 +277,55 @@ def library_path(root: Path, meta: tags_mod.BookMetadata, *, suffix: str = ".m4b
 # --------------------------------------------------------------------------- #
 
 
+def existing_case(parent: Path, name: str) -> str | None:
+    """The on-disk spelling of a directory called *name*, ignoring case.
+
+    Returns None when no such directory exists.  An exact match always wins;
+    when two case variants are already there (the library has a few, from
+    before this existed) the sorted-first spelling is chosen, which is stable
+    across runs and prefers the capitalised form.
+    """
+
+    try:
+        entries = [entry.name for entry in parent.iterdir() if entry.is_dir()]
+    except OSError:
+        return None
+    if name in entries:
+        return name
+    folded = name.casefold()
+    variants = sorted(entry for entry in entries if entry.casefold() == folded)
+    return variants[0] if variants else None
+
+
+def match_existing_case(root: Path, target: Path) -> Path:
+    """Re-spell *target*'s directories to match ones already in the library.
+
+    A book tagged "Funa" files into the existing ``FUNA/`` rather than beside
+    it.  The library is read over SMB and from Windows, where two directories
+    differing only in case cannot both be addressed: the client lists both and
+    shows the contents of whichever the server matched first, so one of them
+    becomes unreachable.  Four series in this library were split that way
+    before this existed, with consecutive volumes in different folders.
+
+    Author names are not normalised to do it - "eden Hudson", "FUNA" and
+    "von Goethe" are all spelled the way their author spells them, and any rule
+    that picked a capitalisation would be wrong often enough to make things
+    worse.  Only an existing directory's spelling is reused, and only the
+    directory components: the file name is left to
+    :func:`forge.paths.collision_safe_path`, which compares without case.
+    """
+
+    try:
+        parts = target.relative_to(root).parts
+    except ValueError:  # not under root; nothing to reconcile against
+        return target
+
+    resolved = root
+    for part in parts[:-1]:
+        resolved = resolved / (existing_case(resolved, part) or part)
+    return resolved / parts[-1]
+
+
 def find_books(source: Path, *, exclude: Iterable[Path] = ()) -> tuple[list[Path], list[tuple[Path, str]]]:
     """Return ``(candidates, in_progress)`` for the m4b files under *source*.
 
@@ -394,7 +443,10 @@ def plan_book(
             )
 
     target = collision_safe_path(
-        library_path(cfg.library_dir, meta, suffix=path.suffix.casefold()),
+        match_existing_case(
+            cfg.library_dir,
+            library_path(cfg.library_dir, meta, suffix=path.suffix.casefold()),
+        ),
         reserved=reserved,
     )
     return ShelvePlan(

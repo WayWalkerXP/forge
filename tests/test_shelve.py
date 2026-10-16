@@ -314,6 +314,110 @@ class Planning(ShelveCase):
         self.assertEqual(plan.target.name, "B (2).m4b")
 
 
+class CaseInsensitiveFolders(unittest.TestCase):
+    """A folder differing only in case is reused, not duplicated.
+
+    The library is read over SMB and from Windows, which cannot address two
+    names that differ only in case: both are listed, both open the same one,
+    and the other's contents are unreachable.  Four series in the live library
+    were split across such a pair before this existed.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.tmp = tempfile.mkdtemp(prefix="forge-case-")
+        self.root = Path(self.tmp)
+
+    def tearDown(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def resolve(self, *parts: str) -> Path:
+        return shelve_mod.match_existing_case(self.root, self.root.joinpath(*parts))
+
+    def test_an_author_folder_is_reused_whatever_the_tag_says(self) -> None:
+        (self.root / "FUNA" / "A Series").mkdir(parents=True)
+        self.assertEqual(
+            self.resolve("Funa", "A Series", "01 - Book", "Book.m4b"),
+            self.root / "FUNA" / "A Series" / "01 - Book" / "Book.m4b",
+        )
+
+    def test_a_series_folder_is_reused_too(self) -> None:
+        # The live library has one of these: Earth's First StarFighter against
+        # Earth's First Starfighter, under one author.
+        (self.root / "An Author" / "Earth's First StarFighter").mkdir(parents=True)
+        self.assertEqual(
+            self.resolve("An Author", "Earth's First Starfighter", "Book.m4b"),
+            self.root / "An Author" / "Earth's First StarFighter" / "Book.m4b",
+        )
+
+    def test_an_exact_match_wins_over_a_case_variant(self) -> None:
+        (self.root / "FUNA").mkdir()
+        (self.root / "Funa").mkdir()
+        self.assertEqual(self.resolve("Funa", "Book.m4b"), self.root / "Funa" / "Book.m4b")
+
+    def test_two_existing_variants_resolve_the_same_way_every_time(self) -> None:
+        (self.root / "XKarnation").mkdir()
+        (self.root / "Xkarnation").mkdir()
+        first = self.resolve("xkarnation", "Book.m4b")
+        self.assertEqual(first, self.resolve("XKARNATION", "Book.m4b"))
+        self.assertEqual(first.parent.name, "XKarnation")
+
+    def test_a_new_author_keeps_the_spelling_it_was_given(self) -> None:
+        # No normalising: "eden Hudson" is how she spells it.
+        self.assertEqual(
+            self.resolve("eden Hudson", "Book.m4b"), self.root / "eden Hudson" / "Book.m4b"
+        )
+
+    def test_the_file_name_is_left_alone(self) -> None:
+        # Files are the collision checker's business, not this function's.
+        (self.root / "An Author").mkdir()
+        (self.root / "An Author" / "BOOK.m4b").touch()
+        self.assertEqual(
+            self.resolve("An Author", "Book.m4b"), self.root / "An Author" / "Book.m4b"
+        )
+
+    def test_a_file_differing_only_in_case_counts_as_taken(self) -> None:
+        from forge.paths import collision_safe_path
+
+        (self.root / "BOOK.m4b").touch()
+        self.assertEqual(
+            collision_safe_path(self.root / "Book.m4b"), self.root / "Book (2).m4b"
+        )
+
+    def test_a_path_outside_the_library_is_returned_unchanged(self) -> None:
+        elsewhere = Path("/tmp/not/under/the/library/Book.m4b")
+        self.assertEqual(shelve_mod.match_existing_case(self.root, elsewhere), elsewhere)
+
+
+@requires_ffmpeg
+class PlanningAgainstExistingFolders(ShelveCase):
+    def test_a_plan_targets_the_folder_that_is_already_there(self) -> None:
+        (self.library / "FUNA" / "Average").mkdir(parents=True)
+        path = self.book(
+            "book.m4b", author="Funa", album="Volume 2", series="average",
+            series_sequence="2",
+        )
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertEqual(
+            plan.target,
+            self.library / "FUNA" / "Average" / "02 - Volume 2" / "Volume 2.m4b",
+        )
+
+    def test_shelving_puts_the_book_in_the_existing_folder(self) -> None:
+        (self.library / "FUNA").mkdir(parents=True)
+        path = self.book("book.m4b", author="Funa", album="A Book")
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        result = shelve_mod.execute(plan, self.cfg)
+
+        self.assertTrue(result.destination.exists())
+        self.assertEqual(
+            sorted(p.name for p in self.library.iterdir()), ["FUNA"]
+        )
+
+
 @requires_ffmpeg
 class Executing(ShelveCase):
     def shelve(self, path: Path, **kwargs):

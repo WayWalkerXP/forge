@@ -83,12 +83,27 @@ def collision_safe_path(path: Path, *, reserved: set[Path] | None = None) -> Pat
 
     *reserved* holds names already claimed earlier in the same run, so a dry run
     predicts exactly the names a real run would produce.
+
+    "Taken" ignores case, even though Linux does not: these trees are read over
+    SMB and from Windows, where two names differing only in case cannot both be
+    addressed - the client lists both and opens whichever the server matched
+    first.  Writing one beside the other would hide a file rather than add it.
     """
 
     reserved = reserved or set()
 
+    # One listing, not one per candidate: the loop below can ask a thousand
+    # times and the answer cannot change while we hold the lock.
+    siblings = {entry.name.casefold() for entry in _iterdir(path.parent)}
+    reserved_folded = {
+        candidate.name.casefold()
+        for candidate in reserved
+        if candidate.parent == path.parent
+    }
+
     def taken(candidate: Path) -> bool:
-        return candidate.exists() or candidate in reserved
+        folded = candidate.name.casefold()
+        return folded in siblings or folded in reserved_folded or candidate in reserved
 
     if not taken(path):
         return path
@@ -106,6 +121,15 @@ def collision_safe_path(path: Path, *, reserved: set[Path] | None = None) -> Pat
             return candidate
 
     raise OSError(f"could not find a free filename near {path}")
+
+
+def _iterdir(directory: Path) -> list[Path]:
+    """The contents of *directory*, or nothing when it is absent or unreadable."""
+
+    try:
+        return list(directory.iterdir())
+    except OSError:
+        return []
 
 
 def temp_output_path(final_path: Path) -> Path:
