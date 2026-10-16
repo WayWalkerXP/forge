@@ -27,8 +27,9 @@ import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
+from . import authors as authors_mod
 from . import library as library_mod
 from . import tags as tags_mod
 from .archive import move_into_library
@@ -241,7 +242,13 @@ def _year_of(meta: tags_mod.BookMetadata) -> str:
     return match.group(1) if match else ""
 
 
-def library_path(root: Path, meta: tags_mod.BookMetadata, *, suffix: str = ".m4b") -> Path:
+def library_path(
+    root: Path,
+    meta: tags_mod.BookMetadata,
+    *,
+    suffix: str = ".m4b",
+    registry: "authors_mod.AuthorRegistry | None" = None,
+) -> Path:
     """Where *meta* belongs under *root*.
 
     ``Author/Series/NN - Album/Album (year) [asin].m4b``, with the series
@@ -249,6 +256,8 @@ def library_path(root: Path, meta: tags_mod.BookMetadata, *, suffix: str = ".m4b
     """
 
     author = clean_author(meta.author or meta.albumartist)
+    if registry is not None:
+        author = registry.resolve(author).canonical or author
     album = (meta.album or meta.title or "").strip()
     series = (meta.series or "").strip()
     part = format_series_part(meta.series_sequence)
@@ -277,13 +286,19 @@ def library_path(root: Path, meta: tags_mod.BookMetadata, *, suffix: str = ".m4b
 # --------------------------------------------------------------------------- #
 
 
-def existing_case(parent: Path, name: str) -> str | None:
-    """The on-disk spelling of a directory called *name*, ignoring case.
+def existing_case(parent: Path, name: str, *, author_set: bool = False) -> str | None:
+    """The on-disk spelling of a directory called *name*, ignoring spelling.
 
     Returns None when no such directory exists.  An exact match always wins;
-    when two case variants are already there (the library has a few, from
-    before this existed) the sorted-first spelling is chosen, which is stable
-    across runs and prefers the capitalised form.
+    when two variants are already there (the library has a few, from before
+    this existed) the sorted-first spelling is chosen, which is stable across
+    runs and prefers the capitalised form.
+
+    With *author_set*, two folders also match when they name the same people in
+    a different order or spelling: ``Terry Maggert, J. N. Chaney`` is the same
+    collaboration as ``J.N. Chaney, Terry Maggert`` and belongs on one shelf.
+    Only the author level passes this, because only author names come in sets -
+    a series called "Qi=MC^2, Book 2" must not be matched against anything.
     """
 
     try:
@@ -292,9 +307,21 @@ def existing_case(parent: Path, name: str) -> str | None:
         return None
     if name in entries:
         return name
+
     folded = name.casefold()
     variants = sorted(entry for entry in entries if entry.casefold() == folded)
-    return variants[0] if variants else None
+    if variants:
+        return variants[0]
+
+    if author_set:
+        wanted = authors_mod.shelf_key(name)
+        if wanted:
+            same = sorted(
+                entry for entry in entries if authors_mod.shelf_key(entry) == wanted
+            )
+            if same:
+                return same[0]
+    return None
 
 
 def match_existing_case(root: Path, target: Path) -> Path:
@@ -321,8 +348,9 @@ def match_existing_case(root: Path, target: Path) -> Path:
         return target
 
     resolved = root
-    for part in parts[:-1]:
-        resolved = resolved / (existing_case(resolved, part) or part)
+    for index, part in enumerate(parts[:-1]):
+        match = existing_case(resolved, part, author_set=index == 0)
+        resolved = resolved / (match or part)
     return resolved / parts[-1]
 
 
@@ -363,15 +391,27 @@ def as_book(path: Path) -> Book:
     return Book(path=path, is_folder=False, files=[path])
 
 
-def tag_fixes_for(meta: tags_mod.BookMetadata) -> dict[str, object]:
+def tag_fixes_for(
+    meta: tags_mod.BookMetadata,
+    *,
+    registry: "authors_mod.AuthorRegistry | None" = None,
+) -> dict[str, object]:
     """The tag edits a book needs before it goes into the library.
 
-    Two of them, both for Audiobookshelf's benefit:
+    Three of them, all for Audiobookshelf's benefit, because it indexes the
+    author *tag* rather than the folder:
 
-    *   the author tags with role credits stripped, because the library groups
-        by author name and "Mary Smith - Translator" becomes her own shelf, and
+    *   role credits stripped, so "Mary Smith - Translator" does not become her
+        own shelf;
+    *   each remaining contributor written the way the registry says, so one
+        author is one author however Amazon spelled them this time; and
     *   no track number, because a single-file book carrying ``trkn`` is shown
         as track 1 of a set.
+
+    The canonical pass only renames contributors the registry can identify.  An
+    unknown spelling is left exactly as it is: a tag forge cannot fully resolve
+    is still a correct tag, and guessing is what this whole mechanism exists to
+    avoid.
     """
 
     fixes: dict[str, object] = {}
@@ -380,6 +420,8 @@ def tag_fixes_for(meta: tags_mod.BookMetadata) -> dict[str, object]:
         if not current:
             continue
         cleaned = clean_author(current)
+        if registry is not None:
+            cleaned = registry.resolve(cleaned).canonical or cleaned
         if cleaned != current:
             fixes[field_name] = cleaned
     if meta.track is not None:
@@ -393,6 +435,7 @@ def plan_book(
     *,
     client: library_mod.AudiobookshelfClient | None = None,
     reserved: set[Path] | None = None,
+    registry: "authors_mod.AuthorRegistry | None" = None,
 ) -> ShelvePlan:
     """Decide what shelving *path* would do.  Never writes anything."""
 
@@ -409,6 +452,8 @@ def plan_book(
         )
 
     author = clean_author(meta.author or meta.albumartist)
+    if registry is not None:
+        author = registry.resolve(author).canonical or author
     if not author.strip():
         return ShelvePlan(
             source=path, status=ShelveStatus.SKIPPED, book_key=key,
@@ -445,7 +490,9 @@ def plan_book(
     target = collision_safe_path(
         match_existing_case(
             cfg.library_dir,
-            library_path(cfg.library_dir, meta, suffix=path.suffix.casefold()),
+            library_path(
+                cfg.library_dir, meta, suffix=path.suffix.casefold(), registry=registry
+            ),
         ),
         reserved=reserved,
     )
@@ -453,7 +500,7 @@ def plan_book(
         source=path,
         status=ShelveStatus.READY,
         target=target,
-        tag_fixes=tag_fixes_for(meta),
+        tag_fixes=tag_fixes_for(meta, registry=registry),
         book_key=key,
     )
 
@@ -463,17 +510,111 @@ def plan_many(
     cfg: Config,
     *,
     client: library_mod.AudiobookshelfClient | None = None,
+    registry: "authors_mod.AuthorRegistry | None" = None,
 ) -> list[ShelvePlan]:
     """Plan a whole batch, so two books cannot be sent to the same name."""
 
     reserved: set[Path] = set()
     plans: list[ShelvePlan] = []
     for path in paths:
-        plan = plan_book(path, cfg, client=client, reserved=reserved)
+        plan = plan_book(path, cfg, client=client, reserved=reserved, registry=registry)
         if plan.target is not None:
             reserved.add(plan.target)
         plans.append(plan)
     return plans
+
+
+@dataclass(frozen=True)
+class IdentityPass:
+    """What one identity-learning sweep managed."""
+
+    looked_up: int = 0
+    learned: int = 0
+    already_known: int = 0
+    no_asin: int = 0
+    failed: int = 0
+
+    def describe(self) -> str:
+        parts = [f"{self.already_known} already known"]
+        if self.looked_up:
+            parts.append(f"{self.looked_up} looked up")
+        if self.learned:
+            parts.append(f"{self.learned} new spelling(s)")
+        if self.no_asin:
+            parts.append(f"{self.no_asin} without an ASIN")
+        if self.failed:
+            parts.append(f"{self.failed} could not be looked up")
+        return ", ".join(parts)
+
+
+def learn_identities(
+    paths: Sequence[Path],
+    registry: "authors_mod.AuthorRegistry",
+    audible: object | None,
+    *,
+    progress: Callable[[Path, str], None] | None = None,
+) -> IdentityPass:
+    """Teach the registry who wrote these books, before anything is planned.
+
+    One Audible call per book whose contributors are not all known already, and
+    none at all for a book the registry has seen the authors of - so a second
+    run over the same library is free and offline.
+
+    A lookup that fails is not an error: the book shelves under the spelling it
+    arrived with, which is what forge did before any of this existed.
+    """
+
+    looked_up = learned = known = no_asin = failed = 0
+
+    for path in paths:
+        try:
+            meta = tags_mod.read_metadata(path)
+        except ForgeError:
+            continue
+
+        names = authors_mod.split_authors(
+            clean_author(meta.author or meta.albumartist)
+        )
+        if not names:
+            continue
+        if all(registry.identity(name) is not None for name in names):
+            known += 1
+            continue
+        if not meta.asin or audible is None:
+            no_asin += 1
+            registry.note_unknown(names)
+            continue
+
+        try:
+            contributors = audible.contributors(meta.asin)
+        except Exception as exc:  # a lookup failure must not stop shelving
+            LOGGER.debug("could not look up contributors for %s: %s", path.name, exc)
+            failed += 1
+            registry.note_unknown(names)
+            continue
+
+        looked_up += 1
+        if not contributors:
+            registry.note_unknown(names)
+            continue
+        learned += registry.learn(contributors)
+        # A tag spelling that reduces to the same key as one of Audible's
+        # contributors is now resolved.  One that does not - "Brandon Morris"
+        # against Audible's "Brandon Q. Morris" - cannot be attached without
+        # guessing, so it is recorded as a candidate for someone to settle.
+        registry.note_unknown(
+            [name for name in names if registry.identity(name) is None]
+        )
+        if progress is not None:
+            progress(path, ", ".join(c.name for c in contributors))
+
+    return IdentityPass(
+        looked_up=looked_up,
+        learned=learned,
+        already_known=known,
+        no_asin=no_asin,
+        failed=failed,
+    )
 
 
 def make_client(cfg: Config) -> library_mod.AudiobookshelfClient | None:

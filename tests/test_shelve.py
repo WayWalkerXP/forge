@@ -419,6 +419,187 @@ class PlanningAgainstExistingFolders(ShelveCase):
 
 
 @requires_ffmpeg
+class CanonicalAuthors(ShelveCase):
+    """Shelving writes the registry's spelling, so ABS indexes one author."""
+
+    CHANEY = "B00W2ZAK7E"
+    MAGGERT = "B00EKN8RHG"
+
+    def registry(self):
+        from forge.authors import AuthorRegistry, Contributor
+
+        registry = AuthorRegistry(self.root / "authors.sqlite3")
+        self.addCleanup(registry.close)
+        registry.learn(
+            [
+                Contributor(self.CHANEY, "J.N. Chaney"),
+                Contributor(self.MAGGERT, "Terry Maggert"),
+            ]
+        )
+        return registry
+
+    def test_the_tag_is_rewritten_to_the_canonical_spelling(self) -> None:
+        path = self.book("book.m4b", author="JN Chaney", album="A Book")
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        self.assertEqual(plan.tag_fixes.get("author"), "J.N. Chaney")
+        self.assertEqual(plan.target.parent.parent.name, "J.N. Chaney")
+
+    def test_shelving_writes_that_spelling_into_the_file(self) -> None:
+        path = self.book("book.m4b", author="J N Chaney", album="A Book")
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        result = shelve_mod.execute(plan, self.cfg)
+        self.assertEqual(tags.read_metadata(result.destination).author, "J.N. Chaney")
+
+    def test_role_credits_are_stripped_before_the_name_is_resolved(self) -> None:
+        path = self.book(
+            "book.m4b", author="JN Chaney, Some Translator - translator", album="A Book"
+        )
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        self.assertEqual(plan.tag_fixes.get("author"), "J.N. Chaney")
+
+    def test_an_unknown_author_is_left_alone(self) -> None:
+        path = self.book("book.m4b", author="A Total Newcomer", album="A Book")
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        self.assertNotIn("author", plan.tag_fixes)
+        self.assertEqual(plan.target.parent.parent.name, "A Total Newcomer")
+
+    def test_a_collaboration_keeps_its_billing_order(self) -> None:
+        path = self.book("book.m4b", author="Terry Maggert, J N Chaney", album="A Book")
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        self.assertEqual(plan.tag_fixes.get("author"), "Terry Maggert, J.N. Chaney")
+
+    def test_a_collaboration_joins_the_shelf_it_already_has(self) -> None:
+        # The live library has this both ways round: "J.N. Chaney, Terry
+        # Maggert" with 55 books and "Terry Maggert, J. N. Chaney" with 4.
+        (self.library / "J.N. Chaney, Terry Maggert").mkdir(parents=True)
+        path = self.book("book.m4b", author="Terry Maggert, JN Chaney", album="A Book")
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        self.assertEqual(
+            plan.target.parent.parent.name, "J.N. Chaney, Terry Maggert"
+        )
+
+    def test_a_different_line_up_gets_its_own_shelf(self) -> None:
+        (self.library / "J.N. Chaney, Terry Maggert").mkdir(parents=True)
+        path = self.book("book.m4b", author="JN Chaney", album="A Book")
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        self.assertEqual(plan.target.parent.parent.name, "J.N. Chaney")
+
+    def test_with_no_registry_nothing_changes(self) -> None:
+        path = self.book("book.m4b", author="JN Chaney", album="A Book")
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertNotIn("author", plan.tag_fixes)
+        self.assertEqual(plan.target.parent.parent.name, "JN Chaney")
+
+
+@requires_ffmpeg
+class LearningIdentities(ShelveCase):
+    """The sweep that fills the registry before anything is planned."""
+
+    CHANEY = "B00W2ZAK7E"
+
+    class FakeAudible:
+        def __init__(self, answers=None, fail=False):
+            from forge.authors import Contributor
+
+            self.answers = answers or {
+                "B0DKPH5RT9": (Contributor("B00W2ZAK7E", "J.N. Chaney"),)
+            }
+            self.fail = fail
+            self.calls: list[str] = []
+
+        def contributors(self, asin):
+            self.calls.append(asin)
+            if self.fail:
+                raise RuntimeError("Audible is having a day")
+            return self.answers.get(asin, ())
+
+    def registry(self):
+        from forge.authors import AuthorRegistry
+
+        registry = AuthorRegistry(self.root / "authors.sqlite3")
+        self.addCleanup(registry.close)
+        return registry
+
+    def test_a_lookup_teaches_the_registry(self) -> None:
+        path = self.book("book.m4b", author="J N Chaney", album="A Book", asin="B0DKPH5RT9")
+        registry = self.registry()
+        outcome = shelve_mod.learn_identities([path], registry, self.FakeAudible())
+
+        self.assertEqual(outcome.looked_up, 1)
+        self.assertEqual(registry.canonical_name("JN Chaney"), "J.N. Chaney")
+
+    def test_a_known_author_costs_no_lookup(self) -> None:
+        from forge.authors import Contributor
+
+        path = self.book("book.m4b", author="J N Chaney", album="A Book", asin="B0DKPH5RT9")
+        registry = self.registry()
+        registry.learn([Contributor(self.CHANEY, "J.N. Chaney")])
+
+        audible = self.FakeAudible()
+        outcome = shelve_mod.learn_identities([path], registry, audible)
+
+        self.assertEqual(audible.calls, [])
+        self.assertEqual(outcome.already_known, 1)
+
+    def test_a_book_without_an_asin_is_recorded_as_a_candidate(self) -> None:
+        path = self.book("book.m4b", author="A Newcomer", album="A Book")
+        registry = self.registry()
+        outcome = shelve_mod.learn_identities([path], registry, self.FakeAudible())
+
+        self.assertEqual(outcome.no_asin, 1)
+        self.assertEqual(registry.unknown_names(), [("A Newcomer", 1)])
+
+    def test_a_failed_lookup_does_not_stop_the_sweep(self) -> None:
+        path = self.book("book.m4b", author="A Newcomer", album="A Book", asin="B0DKPH5RT9")
+        registry = self.registry()
+        outcome = shelve_mod.learn_identities(
+            [path], registry, self.FakeAudible(fail=True)
+        )
+
+        self.assertEqual(outcome.failed, 1)
+        self.assertEqual(registry.unknown_names(), [("A Newcomer", 1)])
+
+    def test_a_spelling_audible_does_not_match_becomes_a_candidate(self) -> None:
+        # The Brandon Morris case: the book's tag is missing the middle
+        # initial Audible's own name carries, so no key matches and nothing is
+        # guessed at.
+        from forge.authors import Contributor
+
+        path = self.book("book.m4b", author="Brandon Morris", album="A Book", asin="B0DKPH5RT9")
+        registry = self.registry()
+        audible = self.FakeAudible(
+            answers={"B0DKPH5RT9": (Contributor("B01N7UFRX4", "Brandon Q. Morris"),)}
+        )
+        shelve_mod.learn_identities([path], registry, audible)
+
+        self.assertIsNone(registry.identity("Brandon Morris"))
+        self.assertEqual(registry.canonical_name("Brandon Q. Morris"), "Brandon Q. Morris")
+        self.assertEqual(registry.unknown_names(), [("Brandon Morris", 1)])
+
+    def test_with_no_audible_client_nothing_is_invented(self) -> None:
+        path = self.book("book.m4b", author="A Newcomer", album="A Book", asin="B0DKPH5RT9")
+        registry = self.registry()
+        outcome = shelve_mod.learn_identities([path], registry, None)
+
+        self.assertEqual(outcome.no_asin, 1)
+        self.assertEqual(registry.stats()["authors"], 0)
+
+
+@requires_ffmpeg
 class Executing(ShelveCase):
     def shelve(self, path: Path, **kwargs):
         plan = shelve_mod.plan_book(path, self.cfg, client=self.client())

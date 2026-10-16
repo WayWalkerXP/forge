@@ -97,6 +97,17 @@ class Config:
         return self.state_dir / "history.sqlite3"
 
     @property
+    def authors_db_path(self) -> Path:
+        """The author identity registry.
+
+        Its own file rather than a table in the history database: the two have
+        separate schemas and separate lifetimes, and the change log is the one
+        thing that must never be at risk from a migration of something else.
+        """
+
+        return self.state_dir / "authors.sqlite3"
+
+    @property
     def lock_path(self) -> Path:
         return self.state_dir / "forge.lock"
 

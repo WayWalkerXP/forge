@@ -22,6 +22,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import sys
 import time
@@ -160,6 +161,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-settle", action="store_true", help="skip the wait for files to stop changing"
     )
     shelve.add_argument(
+        "--no-author-lookup",
+        action="store_true",
+        help="do not ask Audible who an unrecognised author is; the registry "
+        "still answers from what it already knows",
+    )
+    shelve.add_argument(
+        "--no-canonical-authors",
+        action="store_true",
+        help="shelve under the author spelling in the tags, without consulting "
+        "the identity registry at all",
+    )
+    shelve.add_argument(
         "--no-duplicate-check",
         action="store_true",
         help="do not ask Audiobookshelf whether a book is already shelved",
@@ -216,6 +229,45 @@ def build_parser() -> argparse.ArgumentParser:
     hist.add_argument("--limit", type=int, default=20, help="how many groups to show")
     hist.add_argument("--stats", action="store_true", help="database statistics")
     hist.add_argument("--prune", type=int, metavar="DAYS", help="delete records older than DAYS")
+
+    authors_cmd = sub.add_parser(
+        "authors",
+        help="inspect and correct the author identity registry",
+        description="Amazon spells the same author several ways; Audible gives each "
+        "one an ASIN that does not vary. This is where those answers are kept. With "
+        "no arguments, reports what the registry knows and what it could not place.",
+        parents=[shared],
+    )
+    authors_cmd.add_argument(
+        "name",
+        nargs="?",
+        help="show what the registry makes of this author spelling",
+    )
+    authors_cmd.add_argument(
+        "--link",
+        nargs=2,
+        metavar=("SPELLING", "ASIN"),
+        help="declare that SPELLING is the author with this Audible ASIN - the "
+        "'Brandon Morris' / 'Brandon Q. Morris' case, which nothing can infer",
+    )
+    authors_cmd.add_argument(
+        "--name",
+        dest="canonical",
+        metavar="NAME",
+        help="with --link, the spelling this author should be written as",
+    )
+    authors_cmd.add_argument(
+        "--rename",
+        nargs=2,
+        metavar=("ASIN", "NAME"),
+        help="change the canonical spelling of a known author",
+    )
+    authors_cmd.add_argument(
+        "--unknown", action="store_true", help="list only the spellings it could not place"
+    )
+    authors_cmd.add_argument(
+        "--limit", type=int, default=25, help="how many rows to show"
+    )
 
     undo = sub.add_parser(
         "undo",
@@ -552,41 +604,90 @@ def cmd_shelve(args: argparse.Namespace) -> int:
             f"shelving {len(paths)} book(s) from {source} into {library}"
             + ("  [dry run]" if args.dry_run else "")
         )
-        plans = shelve_mod.plan_many(paths, cfg, client=client)
 
-        if args.dry_run or args.csv:
-            renderer.shelve_table(plans)
-        if args.csv:
-            _write_shelve_csv(args.csv, plans, csv_mod)
-            renderer.info(f"plan written to {args.csv}")
+        # Identities first, because the canonical author name decides both the
+        # tags that get written and the shelf they are written to.
+        with _author_registry(cfg, enabled=not args.no_canonical_authors) as registry:
+            if registry is not None:
+                with _audible_for_identities(renderer, args) as audible:
+                    outcome = shelve_mod.learn_identities(paths, registry, audible)
+                renderer.info(f"author identities: {outcome.describe()}")
+            plans = shelve_mod.plan_many(paths, cfg, client=client, registry=registry)
 
-        results: list = []
-        total = len(plans)
-        interrupted = False
+            if args.dry_run or args.csv:
+                renderer.shelve_table(plans)
+            if args.csv:
+                _write_shelve_csv(args.csv, plans, csv_mod)
+                renderer.info(f"plan written to {args.csv}")
 
-        with RunController(allow_keys=not args.dry_run) as controller:
-            for index, plan in enumerate(plans, 1):
-                result = shelve_mod.execute(
-                    plan, cfg, duplicates_dir=duplicates, dry_run=args.dry_run
-                )
-                results.append(result)
-                if not args.dry_run:
-                    renderer.shelve_book(result, index, total)
+            results: list = []
+            total = len(plans)
+            interrupted = False
 
-                # Between books, never mid-move.
-                if controller.should_stop(prompt=renderer.info):
-                    interrupted = True
-                    remaining = total - index
-                    if remaining:
-                        renderer.warn(f"stopped by request with {remaining} book(s) left")
-                    break
+            with RunController(allow_keys=not args.dry_run) as controller:
+                for index, plan in enumerate(plans, 1):
+                    result = shelve_mod.execute(
+                        plan, cfg, duplicates_dir=duplicates, dry_run=args.dry_run
+                    )
+                    results.append(result)
+                    if not args.dry_run:
+                        renderer.shelve_book(result, index, total)
 
-        renderer.shelve_summary(results, time.monotonic() - started)
+                    # Between books, never mid-move.
+                    if controller.should_stop(prompt=renderer.info):
+                        interrupted = True
+                        remaining = total - index
+                        if remaining:
+                            renderer.warn(f"stopped by request with {remaining} book(s) left")
+                        break
 
-    failures = sum(1 for r in results if not r.ok)
-    if failures:
-        return EXIT_FAILURES
-    return EXIT_INTERRUPTED if interrupted else EXIT_OK
+            renderer.shelve_summary(results, time.monotonic() - started)
+
+        failures = sum(1 for r in results if not r.ok)
+        if failures:
+            return EXIT_FAILURES
+        return EXIT_INTERRUPTED if interrupted else EXIT_OK
+
+
+@contextlib.contextmanager
+def _author_registry(cfg, *, enabled: bool):
+    """The author identity registry, or None when it is switched off."""
+
+    if not enabled:
+        yield None
+        return
+
+    from . import authors as authors_mod
+
+    with authors_mod.AuthorRegistry(cfg.authors_db_path) as registry:
+        yield registry
+
+
+@contextlib.contextmanager
+def _audible_for_identities(renderer, args):
+    """An Audible client for identity lookups, or None.
+
+    None is a working configuration, not a failure: the registry still answers
+    from what it already knows, and an unrecognised spelling is left alone.
+    """
+
+    if getattr(args, "no_author_lookup", False):
+        yield None
+        return
+
+    from .audible import AudibleClient
+
+    try:
+        client = AudibleClient()
+    except Exception as exc:  # pragma: no cover - construction is local
+        renderer.warn(f"author lookups unavailable: {exc}")
+        yield None
+        return
+
+    try:
+        yield client
+    finally:
+        client.close()
 
 
 def _shelve_candidates(
@@ -1050,6 +1151,79 @@ def _record_history(args: argparse.Namespace, path: Path, changes: dict, *, sour
         LOGGER.debug("could not record history for %s", path, exc_info=True)
 
 
+def cmd_authors(args: argparse.Namespace) -> int:
+    """Inspect and correct the author identity registry."""
+
+    from . import authors as authors_mod
+    from . import render
+
+    cfg = _load_config(args)
+    renderer = render.make_renderer(force_plain=args.plain, no_color=args.no_color)
+
+    with authors_mod.AuthorRegistry(cfg.authors_db_path) as registry:
+        if args.rename:
+            asin, name = args.rename
+            registry.rename(asin, name)
+            renderer.info(f"{asin} is now written as {name!r}")
+            return EXIT_OK
+
+        if args.link:
+            spelling, asin = args.link
+            try:
+                registry.link(spelling, asin, canonical_name=args.canonical)
+            except ValueError as exc:
+                renderer.warn(str(exc))
+                return EXIT_USAGE
+            canonical = registry.canonical_name(spelling)
+            renderer.info(f"{spelling!r} is {asin} — written as {canonical!r}")
+            return EXIT_OK
+
+        if args.name:
+            asin = registry.identity(args.name)
+            if asin is None:
+                renderer.info(
+                    f"{args.name!r} is not in the registry "
+                    f"(key {authors_mod.name_key(args.name)!r})"
+                )
+                return EXIT_OK
+            renderer.info(f"{args.name!r} is {asin}")
+            renderer.info(f"  written as: {registry.canonical_name(args.name)!r}")
+            for spelling in registry.aliases_of(asin):
+                renderer.info(f"  also seen as: {spelling!r}")
+            return EXIT_OK
+
+        unknown = registry.unknown_names()
+        if args.unknown:
+            if not unknown:
+                renderer.info("every author seen so far has an identity")
+                return EXIT_OK
+            renderer.info(f"{len(unknown)} spelling(s) with no identity:")
+            for spelling, seen in unknown[: args.limit]:
+                renderer.info(f"  {spelling}  (seen {seen}×)")
+            return EXIT_OK
+
+        stats = registry.stats()
+        renderer.info(
+            f"{stats['authors']} author(s), {stats['aliases']} spelling(s), "
+            f"{stats['unknown']} unplaced"
+        )
+        multiple = [row for row in registry.identities() if row[2] > 1]
+        if multiple:
+            renderer.info("")
+            renderer.info("authors Amazon spells more than one way:")
+            for asin, name, count in multiple[: args.limit]:
+                spellings = ", ".join(repr(s) for s in registry.aliases_of(asin))
+                renderer.info(f"  {name}  ({count}) {asin}")
+                renderer.info(f"      {spellings}")
+        if unknown:
+            renderer.info("")
+            renderer.info(
+                f"{len(unknown)} spelling(s) could not be placed; "
+                f"`forge authors --unknown` lists them"
+            )
+        return EXIT_OK
+
+
 _HANDLERS = {
     "triage": cmd_triage,
     "run": cmd_run,
@@ -1060,6 +1234,7 @@ _HANDLERS = {
     "lookup": cmd_lookup,
     "history": cmd_history,
     "undo": cmd_undo,
+    "authors": cmd_authors,
 }
 
 

@@ -180,6 +180,73 @@ information. **Ties break by file name**, so the list does not shuffle between
 refreshes. The order survives a filter change and a rescan, and the cursor stays
 on the book it was on.
 
+### One author, however Amazon spelled them
+
+Amazon's contributor records do not insist on one spelling, so the same author
+arrives as `J.N. Chaney`, `J. N. Chaney`, `JN Chaney` and `J N Chaney` —
+sometimes two of those from one API call. Audiobookshelf indexes the author
+*tag*, so each spelling becomes its own shelf there, and the library tree grows
+a folder per spelling to match. One author in this library had 31 folders and
+245 books.
+
+What makes it tractable is that **Audible gives every contributor an ASIN, and
+that ASIN does not vary**:
+
+```
+tag "JN Chaney"      → B00W2ZAK7E
+tag "J. N. Chaney"   → B00W2ZAK7E
+tag "J.N. Chaney"    → B00W2ZAK7E
+```
+
+So identity is a lookup, not a guess. `forge/authors.py` keeps the answers in
+its own SQLite file (`state_dir/authors.sqlite3`): an `author` table of
+identities, and an `author_alias` table mapping every spelling ever seen to one
+of them. `shelve` resolves each contributor through it, writes the canonical
+spelling into the tag — so ABS indexes one author — and files the book under
+that name, so the folder follows the tag rather than being fixed separately.
+
+Three tiers, strongest first:
+
+1. **The book has an ASIN**, so Audible names its contributors and their ASINs.
+   One call per book whose authors are not already known, and none at all for a
+   book whose authors the registry has seen, so a second run is free.
+2. **No ASIN**, but the spelling reduces to a key already in the alias table —
+   casefolded, punctuation and spacing dropped — so `J N Chaney` resolves
+   offline.
+3. **Neither.** Nothing happens. The name is written exactly as it arrived and
+   recorded as a candidate, because the alternative is guessing.
+
+**The key deliberately does not drop initials.** `Brandon Morris` and
+`Brandon Q. Morris` reduce to different keys and are never joined
+automatically: they might be two people, and a rule clever enough to join them
+is also clever enough to join two real authors who share a surname. Only an
+author ASIN, or `forge authors --link`, settles that case — once, permanently.
+
+Collaborations get one shelf per line-up, order-insensitively: a book tagged
+`Terry Maggert, J. N. Chaney` joins the existing `J.N. Chaney, Terry Maggert`
+folder rather than starting a fourth spelling of the same partnership. The
+billing order in the tag is left as Audible gives it, because that is
+information.
+
+| command | what it does |
+|---|---|
+| `forge authors` | what the registry knows, and which authors Amazon spells more than one way |
+| `forge authors "JN Chaney"` | the identity behind one spelling, and its other spellings |
+| `forge authors --unknown` | spellings it could not place |
+| `forge authors --link "Brandon Morris" B01N7UFRX4` | declare a spelling to be a known author |
+| `forge authors --rename B00W2ZAK7E "J. N. Chaney"` | change how an author is written |
+
+`forge shelve --no-author-lookup` keeps the registry but asks Audible nothing;
+`--no-canonical-authors` ignores the registry altogether and shelves under
+whatever the tags say.
+
+**Known rough edge.** The canonical spelling is whichever one was learned first,
+which is effectively arbitrary — Amazon's own display name for an author varies
+between products. It is stable (a later lookup never renames an author, because
+that would make the library rename itself at random), and `--rename` fixes any
+you care about. Choosing it by frequency across the whole library is a job for
+the backfill pass, which has the whole library to count over.
+
 ### Quitting while something is running
 
 `q` quits immediately when nothing is in flight. If a write is still going it

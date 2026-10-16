@@ -264,6 +264,39 @@ class AudibleClient:
             )
         return metadata
 
+    def contributors(self, asin: str) -> tuple["Contributor", ...]:
+        """The authors of a book, with the ASIN Audible identifies each one by.
+
+        A separate call from :meth:`lookup` because it asks for one response
+        group rather than nine, and because identity resolution wants it for
+        books whose tags are otherwise fine and must not be overwritten.
+
+        The ASIN is the point.  Audible's own display name for one author
+        varies between products - the same B00W2ZAK7E comes back as both
+        "J.N. Chaney" and "J. N. Chaney" - while the ASIN never does.
+        """
+
+        from .authors import Contributor
+
+        checked = validate_asin(asin)
+        payload = self._get(
+            f"/1.0/catalog/products/{checked}", {"response_groups": "contributors"}
+        )
+        product = payload.get("product")
+        if not isinstance(product, dict):
+            raise AudibleError(f"Audible returned no product for {checked}")
+
+        found: list[Contributor] = []
+        for entry in product.get("authors") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            author_asin = str(entry.get("asin") or "").strip()
+            # A name with no ASIN carries no identity, so it is no use here.
+            if name and author_asin:
+                found.append(Contributor(asin=author_asin, name=name))
+        return tuple(found)
+
     def search_url(self, *, title: str, author: str | None = None) -> str:
         keywords = f"{author} {clean_search_title(title)}".strip() if author else clean_search_title(title)
         return f"https://{self.host}/1.0/catalog/products?{urlencode({'keywords': keywords})}"
