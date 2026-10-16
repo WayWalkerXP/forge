@@ -246,9 +246,11 @@ def build_parser() -> argparse.ArgumentParser:
     authors_cmd.add_argument(
         "--link",
         nargs=2,
-        metavar=("SPELLING", "ASIN"),
-        help="declare that SPELLING is the author with this Audible ASIN - the "
-        "'Brandon Morris' / 'Brandon Q. Morris' case, which nothing can infer",
+        metavar=("SPELLING", "IDENTITY"),
+        help="declare that SPELLING is this author - the 'Brandon Morris' / "
+        "'Brandon Q. Morris' case, which nothing can infer. IDENTITY is an "
+        "Audible contributor ASIN, or the name:<key> form shown by "
+        "`forge authors <name>` for an author Amazon has no ASIN for",
     )
     authors_cmd.add_argument(
         "--name",
@@ -259,7 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     authors_cmd.add_argument(
         "--rename",
         nargs=2,
-        metavar=("ASIN", "NAME"),
+        metavar=("IDENTITY", "NAME"),
         help="change the canonical spelling of a known author",
     )
     authors_cmd.add_argument(
@@ -1162,20 +1164,20 @@ def cmd_authors(args: argparse.Namespace) -> int:
 
     with authors_mod.AuthorRegistry(cfg.authors_db_path) as registry:
         if args.rename:
-            asin, name = args.rename
-            registry.rename(asin, name)
-            renderer.info(f"{asin} is now written as {name!r}")
+            identity, name = args.rename
+            registry.rename(identity, name)
+            renderer.info(f"{identity} is now written as {name!r}")
             return EXIT_OK
 
         if args.link:
-            spelling, asin = args.link
+            spelling, identity = args.link
             try:
-                registry.link(spelling, asin, canonical_name=args.canonical)
+                registry.link(spelling, identity, canonical_name=args.canonical)
             except ValueError as exc:
                 renderer.warn(str(exc))
                 return EXIT_USAGE
             canonical = registry.canonical_name(spelling)
-            renderer.info(f"{spelling!r} is {asin} — written as {canonical!r}")
+            renderer.info(f"{spelling!r} is {identity} — written as {canonical!r}")
             return EXIT_OK
 
         if args.name:

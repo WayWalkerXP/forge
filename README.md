@@ -207,9 +207,13 @@ that name, so the folder follows the tag rather than being fixed separately.
 
 Three tiers, strongest first:
 
-1. **The book has an ASIN**, so Audible names its contributors and their ASINs.
-   One call per book whose authors are not already known, and none at all for a
-   book whose authors the registry has seen, so a second run is free.
+1. **The book has an ASIN**, so Audible names its contributors. Where it also
+   gives a contributor ASIN, that is the identity. Where it does not — and for
+   self-published authors it very often does not, returning a bare
+   `{"name": "Rhaegar"}` — the identity is derived from the name itself and
+   stored as `name:rhaegar`, which is weaker and says so. One call per book
+   whose authors are not already known, and none at all for a book whose
+   authors the registry has seen, so a second run is free.
 2. **No ASIN**, but the spelling reduces to a key already in the alias table —
    casefolded, punctuation and spacing dropped — so `J N Chaney` resolves
    offline.
@@ -256,7 +260,7 @@ that rewrite is the mechanism working.
 | `forge authors` | what the registry knows, and which authors Amazon spells more than one way |
 | `forge authors "JN Chaney"` | the identity behind one spelling, and its other spellings |
 | `forge authors --unknown` | spellings it could not place |
-| `forge authors --link "Brandon Morris" B01N7UFRX4` | declare a spelling to be a known author |
+| `forge authors --link "Brandon Morris" B01N7UFRX4` | declare a spelling to be a known author (an ASIN, or a `name:` identity) |
 | `forge authors --rename B00W2ZAK7E "J. N. Chaney"` | change how an author is written |
 
 `forge shelve --no-author-lookup` keeps the registry but asks Audible nothing;

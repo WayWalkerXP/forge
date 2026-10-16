@@ -420,8 +420,10 @@ def rank_by_runtime(results: list[SearchResult], source_seconds: float | None) -
 def _contributors(value: Any) -> tuple["Contributor", ...]:
     """Authors as (ASIN, name) pairs, for identity rather than for display.
 
-    A name with no ASIN carries no identity, so it is dropped here - it still
-    reaches the tags through :func:`_names`.
+    A name with no ASIN is kept, with None in its place.  Amazon has no
+    contributor record for a great many self-published authors - "Rhaegar",
+    "X-RHODEN-X", "Mira González" all come back as a bare name - and dropping
+    them meant their identity could never be recorded at all.
     """
 
     from .authors import Contributor
@@ -434,8 +436,8 @@ def _contributors(value: Any) -> tuple["Contributor", ...]:
             continue
         name = str(entry.get("name") or "").strip()
         asin = str(entry.get("asin") or "").strip()
-        if name and asin:
-            found.append(Contributor(asin=asin, name=name))
+        if name:
+            found.append(Contributor(asin=asin or None, name=name))
     return tuple(found)
 
 

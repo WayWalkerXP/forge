@@ -56,6 +56,78 @@ class Keys(unittest.TestCase):
         )
 
 
+class SchemaUpgrade(TempCaseMixin, unittest.TestCase):
+    """A registry written by the first version still opens."""
+
+    def v1_database(self):
+        import sqlite3
+
+        path = self.root / "authors.sqlite3"
+        connection = sqlite3.connect(str(path), isolation_level=None)
+        connection.executescript(
+            """
+            CREATE TABLE schema_info (version INTEGER NOT NULL);
+            CREATE TABLE author (
+                author_asin    TEXT PRIMARY KEY,
+                canonical_name TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+            CREATE TABLE author_alias (
+                name_key    TEXT PRIMARY KEY,
+                author_asin TEXT NOT NULL REFERENCES author(author_asin),
+                spelling    TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE TABLE author_unknown (
+                name_key   TEXT PRIMARY KEY,
+                spelling   TEXT NOT NULL,
+                seen       INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO schema_info VALUES (1);
+            INSERT INTO author VALUES ('B00W2ZAK7E', 'J.N. Chaney', '2026-10-16T00:00:00+00:00');
+            INSERT INTO author_alias VALUES
+                ('jnchaney', 'B00W2ZAK7E', 'J.N. Chaney', 'audible', '2026-10-16T00:00:00+00:00');
+            -- keyed the old way, with the accent deleted rather than folded
+            INSERT INTO author VALUES ('B000000001', 'Mira González', '2026-10-16T00:00:00+00:00');
+            INSERT INTO author_alias VALUES
+                ('miragonzlez', 'B000000001', 'Mira González', 'audible', '2026-10-16T00:00:00+00:00');
+            """
+        )
+        connection.close()
+        return path
+
+    def test_a_v1_registry_keeps_its_identities(self) -> None:
+        path = self.v1_database()
+        with AuthorRegistry(path) as registry:
+            self.assertEqual(registry.identity("JN Chaney"), "B00W2ZAK7E")
+            self.assertEqual(registry.canonical_name("J N Chaney"), "J.N. Chaney")
+
+    def test_the_upgrade_recomputes_keys_built_the_old_way(self) -> None:
+        path = self.v1_database()
+        with AuthorRegistry(path) as registry:
+            # "miragonzlez" was the old key; both spellings must resolve now.
+            self.assertEqual(registry.identity("Mira González"), "B000000001")
+            self.assertEqual(registry.identity("Mira Gonzalez"), "B000000001")
+
+    def test_an_upgraded_registry_records_the_new_version(self) -> None:
+        from forge.authors import SCHEMA_VERSION
+
+        path = self.v1_database()
+        with AuthorRegistry(path) as registry:
+            row = registry._connection.execute("SELECT version FROM schema_info").fetchone()
+            self.assertEqual(row["version"], SCHEMA_VERSION)
+
+    def test_opening_it_twice_is_harmless(self) -> None:
+        path = self.v1_database()
+        with AuthorRegistry(path) as registry:
+            registry.learn([Contributor(None, "Rhaegar")])
+        with AuthorRegistry(path) as registry:
+            self.assertEqual(registry.identity("Rhaegar"), "name:rhaegar")
+            self.assertEqual(registry.identity("JN Chaney"), "B00W2ZAK7E")
+
+
 class Registry(TempCaseMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -88,9 +160,39 @@ class Registry(TempCaseMixin, unittest.TestCase):
             sorted(self.registry.aliases_of(CHANEY)), ["Chaney, J.N.", "J.N. Chaney"]
         )
 
-    def test_a_contributor_without_an_asin_is_ignored(self) -> None:
-        self.registry.learn([Contributor("", "Nobody In Particular")])
-        self.assertIsNone(self.registry.identity("Nobody In Particular"))
+    def test_an_author_amazon_has_no_id_for_still_gets_an_identity(self) -> None:
+        # Amazon holds no contributor record for a great many self-published
+        # authors: the catalogue returns {"name": "Rhaegar"} and nothing else.
+        # Without an identity of their own, accepting a lookup for one of their
+        # books recorded nothing, so triage went on flagging the author as new
+        # however many times it was looked up.
+        self.registry.learn([Contributor(None, "Rhaegar")])
+        self.assertEqual(self.registry.identity("Rhaegar"), "name:rhaegar")
+        self.assertEqual(self.registry.canonical_name("rhaegar"), "Rhaegar")
+
+    def test_a_name_identity_is_marked_as_the_weaker_kind(self) -> None:
+        from forge.authors import SOURCE_AUDIBLE_NO_ASIN
+
+        self.registry.learn([Contributor(None, "X-RHODEN-X")])
+        row = self.registry._connection.execute(
+            "SELECT source, audible_asin FROM author_alias "
+            "JOIN author USING (author_id) WHERE name_key = ?",
+            ("xrhodenx",),
+        ).fetchone()
+        self.assertEqual(row["source"], SOURCE_AUDIBLE_NO_ASIN)
+        self.assertIsNone(row["audible_asin"])
+
+    def test_an_accented_name_keys_the_same_either_way(self) -> None:
+        # Amazon writes this author's surname both ways; the tag on the file
+        # has the accent and other places do not.
+        self.registry.learn([Contributor(None, "Mira González")])
+        self.assertEqual(
+            self.registry.identity("Mira Gonzalez"), self.registry.identity("Mira González")
+        )
+
+    def test_a_contributor_with_no_name_at_all_is_ignored(self) -> None:
+        self.registry.learn([Contributor(None, "   ")])
+        self.assertEqual(self.registry.stats()["authors"], 0)
 
     def test_resolving_a_tag_keeps_the_billing_order(self) -> None:
         self.registry.learn(

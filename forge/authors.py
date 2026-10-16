@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,28 +44,33 @@ from typing import Iterable, Iterator, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_info (
     version INTEGER NOT NULL
 );
 
+-- author_id is an Audible contributor ASIN where there is one, and
+-- "name:<key>" where there is not.  The first version of this table called the
+-- column author_asin, which was a lie for every self-published author in the
+-- catalogue: Amazon returns their name with no id at all.
 CREATE TABLE IF NOT EXISTS author (
-    author_asin    TEXT PRIMARY KEY,
+    author_id      TEXT PRIMARY KEY,
+    audible_asin   TEXT,
     canonical_name TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS author_alias (
     name_key    TEXT PRIMARY KEY,
-    author_asin TEXT NOT NULL REFERENCES author(author_asin) ON DELETE CASCADE,
+    author_id   TEXT NOT NULL REFERENCES author(author_id) ON DELETE CASCADE,
     spelling    TEXT NOT NULL,
     source      TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS author_alias_by_author ON author_alias (author_asin);
+CREATE INDEX IF NOT EXISTS author_alias_by_author ON author_alias (author_id);
 
 -- Spellings seen with no identity behind them yet: tier 3.  Kept so the
 -- candidate list is a query rather than a re-scan of the whole library.
@@ -76,8 +82,8 @@ CREATE TABLE IF NOT EXISTS author_unknown (
 );
 """
 
-#: Anything that is not a letter or a digit is noise for identity purposes:
-#: it is the difference between "J.N." and "J N", and nothing else.
+#: Anything that is not an unaccented letter or a digit is noise for identity
+#: purposes: it is the difference between "J.N." and "J N", and nothing else.
 _NOISE = re.compile(r"[^0-9a-z]+")
 
 #: Author tags separate contributors with commas.  Semicolons appear too
@@ -85,6 +91,10 @@ _NOISE = re.compile(r"[^0-9a-z]+")
 _SEPARATORS = re.compile(r"\s*[;,]\s*")
 
 SOURCE_AUDIBLE = "audible"
+#: Audible named the author but gave no contributor id, so the identity is
+#: derived from the name.  Recorded separately because a backfill could promote
+#: one of these if Amazon ever issues the author an ASIN.
+SOURCE_AUDIBLE_NO_ASIN = "audible-no-asin"
 SOURCE_MANUAL = "manual"
 
 
@@ -96,7 +106,12 @@ def name_key(name: str) -> str:
     not reduce to the same thing, on purpose: see the module docstring.
     """
 
-    return _NOISE.sub("", name.casefold())
+    # Accents are folded, not dropped.  Amazon writes this author's surname
+    # both ways - "Mira González" in the tag, "Mira Gonzalez" elsewhere - and
+    # deleting the "ó" would key them as "gonzlez" and "gonzalez", two people.
+    decomposed = unicodedata.normalize("NFKD", name.casefold())
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return _NOISE.sub("", stripped)
 
 
 def split_authors(value: str | None) -> list[str]:
@@ -125,10 +140,29 @@ def shelf_key(value: str | None) -> frozenset[str]:
 
 @dataclass(frozen=True)
 class Contributor:
-    """One author as Audible names them."""
+    """One author as Audible names them.
 
-    asin: str
+    ``asin`` is None for the many self-published authors Amazon holds no
+    contributor record for: the catalogue returns ``{"name": "Rhaegar"}`` with
+    no id at all.  Those authors still need an identity, or nothing downstream
+    can ever record that they have been seen - so the name becomes one.
+    """
+
+    asin: str | None
     name: str
+
+    @property
+    def identity(self) -> str:
+        """What this author is keyed by: an Audible ASIN, or their own name.
+
+        A ``name:`` identity is weaker and says so.  Two different authors who
+        reduce to one key would share it - but with no ASIN there is nothing to
+        tell them apart anyway, so this is as good as the data gets.
+        """
+
+        if self.asin:
+            return self.asin
+        return f"name:{name_key(self.name)}"
 
 
 @dataclass(frozen=True)
@@ -182,19 +216,78 @@ class AuthorRegistry:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    def _create_tables(self) -> None:
+        """Run the schema one statement at a time.
+
+        Not ``executescript``: that commits before it starts, which silently
+        ends any transaction the caller had open - and the v1 upgrade needs the
+        new tables created *inside* its transaction.
+        """
+
+        for statement in _SCHEMA.split(";"):
+            if statement.strip():
+                self._connection.execute(statement)
+
     def _migrate(self) -> None:
-        self._connection.executescript(_SCHEMA)
+        self._upgrade_from_v1()
+        self._create_tables()
         row = self._connection.execute("SELECT version FROM schema_info").fetchone()
         if row is None:
             self._connection.execute(
                 "INSERT INTO schema_info (version) VALUES (?)", (SCHEMA_VERSION,)
             )
         elif row["version"] != SCHEMA_VERSION:
-            LOGGER.warning(
-                "author registry is schema version %s, this build expects %s",
-                row["version"],
-                SCHEMA_VERSION,
+            self._connection.execute(
+                "UPDATE schema_info SET version = ?", (SCHEMA_VERSION,)
             )
+
+    def _upgrade_from_v1(self) -> None:
+        """Rebuild a v1 registry: author_asin became author_id.
+
+        Alias keys are recomputed rather than copied, because v1 built them
+        with a key that deleted accented letters instead of folding them.
+        """
+
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(author)").fetchall()
+        }
+        if "author_asin" not in columns:
+            return
+
+        LOGGER.info("upgrading the author registry from schema version 1")
+        authors = self._connection.execute(
+            "SELECT author_asin, canonical_name, updated_at FROM author"
+        ).fetchall()
+        aliases = self._connection.execute(
+            "SELECT author_asin, spelling, source, updated_at FROM author_alias"
+        ).fetchall()
+
+        self._connection.execute("BEGIN")
+        try:
+            self._connection.execute("DROP TABLE author_alias")
+            self._connection.execute("DROP TABLE author")
+            self._create_tables()
+            for row in authors:
+                self._connection.execute(
+                    "INSERT INTO author (author_id, audible_asin, canonical_name, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (row["author_asin"], row["author_asin"], row["canonical_name"],
+                     row["updated_at"]),
+                )
+            for row in aliases:
+                self._connection.execute(
+                    "INSERT INTO author_alias "
+                    "(name_key, author_id, spelling, source, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT (name_key) DO NOTHING",
+                    (name_key(row["spelling"]), row["author_asin"], row["spelling"],
+                     row["source"], row["updated_at"]),
+                )
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
 
     @staticmethod
     def _now() -> str:
@@ -214,66 +307,75 @@ class AuthorRegistry:
 
         learned = 0
         for contributor in contributors:
-            if not contributor.asin or not contributor.name.strip():
-                continue
             key = name_key(contributor.name)
             if not key:
                 continue
+            identity = contributor.identity
+            kind = source if contributor.asin else SOURCE_AUDIBLE_NO_ASIN
             self._connection.execute(
-                "INSERT INTO author (author_asin, canonical_name, updated_at) "
-                "VALUES (?, ?, ?) ON CONFLICT (author_asin) DO NOTHING",
-                (contributor.asin, contributor.name.strip(), self._now()),
+                "INSERT INTO author (author_id, audible_asin, canonical_name, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (author_id) DO NOTHING",
+                (identity, contributor.asin or None, contributor.name.strip(), self._now()),
             )
             cursor = self._connection.execute(
                 "INSERT INTO author_alias "
-                "(name_key, author_asin, spelling, source, updated_at) "
+                "(name_key, author_id, spelling, source, updated_at) "
                 "VALUES (?, ?, ?, ?, ?) ON CONFLICT (name_key) DO NOTHING",
-                (key, contributor.asin, contributor.name.strip(), source, self._now()),
+                (key, identity, contributor.name.strip(), kind, self._now()),
             )
             learned += cursor.rowcount or 0
             self._connection.execute("DELETE FROM author_unknown WHERE name_key = ?", (key,))
         return learned
 
-    def link(self, spelling: str, author_asin: str, *, canonical_name: str | None = None) -> None:
+    def link(self, spelling: str, author_id: str, *, canonical_name: str | None = None) -> None:
         """Point a spelling at an identity by hand.
 
         This is tier 3: the ``Brandon Morris`` / ``Brandon Q. Morris`` case,
         which no key and no lookup can settle.  Stored once, honoured forever.
+
+        *author_id* is an Audible contributor ASIN, or the ``name:<key>`` form
+        that an author Amazon has no id for is kept under.
         """
 
         key = name_key(spelling)
         if not key:
             raise ValueError(f"{spelling!r} has nothing to key on")
         row = self._connection.execute(
-            "SELECT canonical_name FROM author WHERE author_asin = ?", (author_asin,)
+            "SELECT canonical_name FROM author WHERE author_id = ?", (author_id,)
         ).fetchone()
         if row is None:
             if not canonical_name:
                 raise ValueError(
-                    f"{author_asin} is not a known author; pass canonical_name to create it"
+                    f"{author_id} is not a known author; pass canonical_name to create it"
                 )
             self._connection.execute(
-                "INSERT INTO author (author_asin, canonical_name, updated_at) VALUES (?, ?, ?)",
-                (author_asin, canonical_name.strip(), self._now()),
+                "INSERT INTO author (author_id, audible_asin, canonical_name, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    author_id,
+                    None if author_id.startswith("name:") else author_id,
+                    canonical_name.strip(),
+                    self._now(),
+                ),
             )
         elif canonical_name:
-            self.rename(author_asin, canonical_name)
+            self.rename(author_id, canonical_name)
         self._connection.execute(
-            "INSERT INTO author_alias (name_key, author_asin, spelling, source, updated_at) "
+            "INSERT INTO author_alias (name_key, author_id, spelling, source, updated_at) "
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT (name_key) DO UPDATE SET "
-            "author_asin = excluded.author_asin, spelling = excluded.spelling, "
+            "author_id = excluded.author_id, spelling = excluded.spelling, "
             "source = excluded.source, updated_at = excluded.updated_at",
-            (key, author_asin, spelling.strip(), SOURCE_MANUAL, self._now()),
+            (key, author_id, spelling.strip(), SOURCE_MANUAL, self._now()),
         )
         self._connection.execute("DELETE FROM author_unknown WHERE name_key = ?", (key,))
 
-    def rename(self, author_asin: str, canonical_name: str) -> None:
+    def rename(self, author_id: str, canonical_name: str) -> None:
         """Change the spelling an identity is written as."""
 
         self._connection.execute(
-            "UPDATE author SET canonical_name = ?, updated_at = ? WHERE author_asin = ?",
-            (canonical_name.strip(), self._now(), author_asin),
+            "UPDATE author SET canonical_name = ?, updated_at = ? WHERE author_id = ?",
+            (canonical_name.strip(), self._now(), author_id),
         )
 
     def note_unknown(self, names: Iterable[str]) -> None:
@@ -293,19 +395,23 @@ class AuthorRegistry:
     # ------------------------------------------------------------------ read #
 
     def identity(self, name: str) -> str | None:
-        """The author ASIN behind a spelling, if it is known."""
+        """The identity behind a spelling, if it is known.
+
+        An Audible contributor ASIN, or ``name:<key>`` for an author Amazon
+        holds no contributor record for.
+        """
 
         row = self._connection.execute(
-            "SELECT author_asin FROM author_alias WHERE name_key = ?", (name_key(name),)
+            "SELECT author_id FROM author_alias WHERE name_key = ?", (name_key(name),)
         ).fetchone()
-        return row["author_asin"] if row else None
+        return row["author_id"] if row else None
 
     def canonical_name(self, name: str) -> str | None:
         """How this author should be written, if the registry knows them."""
 
         row = self._connection.execute(
             "SELECT author.canonical_name AS canonical_name "
-            "FROM author_alias JOIN author USING (author_asin) "
+            "FROM author_alias JOIN author USING (author_id) "
             "WHERE author_alias.name_key = ?",
             (name_key(name),),
         ).fetchone()
@@ -349,23 +455,23 @@ class AuthorRegistry:
         ).fetchall()
         return [(row["spelling"], row["seen"]) for row in rows]
 
-    def aliases_of(self, author_asin: str) -> list[str]:
+    def aliases_of(self, author_id: str) -> list[str]:
         rows = self._connection.execute(
-            "SELECT spelling FROM author_alias WHERE author_asin = ? ORDER BY spelling",
-            (author_asin,),
+            "SELECT spelling FROM author_alias WHERE author_id = ? ORDER BY spelling",
+            (author_id,),
         ).fetchall()
         return [row["spelling"] for row in rows]
 
     def identities(self) -> list[tuple[str, str, int]]:
-        """Every identity: ASIN, canonical name, number of known spellings."""
+        """Every identity: id, canonical name, number of known spellings."""
 
         rows = self._connection.execute(
-            "SELECT author.author_asin AS asin, author.canonical_name AS name, "
+            "SELECT author.author_id AS id, author.canonical_name AS name, "
             "COUNT(author_alias.name_key) AS aliases "
-            "FROM author LEFT JOIN author_alias USING (author_asin) "
-            "GROUP BY author.author_asin ORDER BY aliases DESC, name"
+            "FROM author LEFT JOIN author_alias USING (author_id) "
+            "GROUP BY author.author_id ORDER BY aliases DESC, name"
         ).fetchall()
-        return [(row["asin"], row["name"], row["aliases"]) for row in rows]
+        return [(row["id"], row["name"], row["aliases"]) for row in rows]
 
     def stats(self) -> dict[str, int]:
         def count(table: str) -> int:
