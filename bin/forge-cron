@@ -1,0 +1,66 @@
+#!/bin/bash
+# Unattended forge pass, for cron: convert, then shelve.
+#
+# Two stages, one log, one lock. A book converted at 02:30 is filed into the
+# library in the same pass, which is what absmove's go.sh used to do from its
+# own crontab line.
+#
+# Uses the system interpreter directly: forge needs no virtual environment, so
+# there is nothing to activate and nothing to go stale.
+#
+# Example crontab entry, nightly at 02:30:
+#   30 2 * * * /home/jrussell/scripts/forge/bin/forge-cron >> /home/jrussell/scripts/forge/cron.log 2>&1
+#
+# Arguments are passed to `forge run`. To skip either stage:
+#   forge-cron --no-shelve      convert only
+#   forge-cron --shelve-only    file already-converted books only
+
+set -u
+
+FORGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+run_stage=1
+shelve_stage=1
+case "${1:-}" in
+    --no-shelve)   run_stage=1; shelve_stage=0; shift ;;
+    --shelve-only) run_stage=0; shelve_stage=1; shift ;;
+esac
+
+# --plain keeps the output line-oriented and free of escape codes. It would be
+# chosen automatically anyway, since stdout is a pipe here, but being explicit
+# means the log looks the same however cron is configured.
+describe() {
+    case "$2" in
+        0)   echo "=== forge $1 finished cleanly: $(date '+%Y-%m-%d %H:%M:%S') ===" ;;
+        1)   echo "=== forge $1 finished WITH FAILURES: $(date '+%Y-%m-%d %H:%M:%S') ===" ;;
+        3)   echo "=== forge $1 could not read its configuration ===" ;;
+        4)   echo "=== forge $1 skipped: another run holds the lock ===" ;;
+        130) echo "=== forge $1 was interrupted: $(date '+%Y-%m-%d %H:%M:%S') ===" ;;
+        *)   echo "=== forge $1 exited $2: $(date '+%Y-%m-%d %H:%M:%S') ===" ;;
+    esac
+}
+
+worst=0
+note() { [ "$1" -gt "$worst" ] && worst="$1"; return 0; }
+
+if [ "${run_stage}" -eq 1 ]; then
+    echo "=== forge run starting: $(date '+%Y-%m-%d %H:%M:%S') ==="
+    "${FORGE_DIR}/bin/forge" run --plain "$@"
+    status=$?
+    describe run "${status}"
+    note "${status}"
+fi
+
+# Shelving runs even when the conversion had failures: the books that did
+# convert should still reach the library, and a book that failed was left where
+# it was with its disposition intact.
+if [ "${shelve_stage}" -eq 1 ]; then
+    echo
+    echo "=== forge shelve starting: $(date '+%Y-%m-%d %H:%M:%S') ==="
+    "${FORGE_DIR}/bin/forge" shelve --plain
+    status=$?
+    describe shelve "${status}"
+    note "${status}"
+fi
+
+exit "${worst}"

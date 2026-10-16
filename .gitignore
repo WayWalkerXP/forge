@@ -1,0 +1,19 @@
+# Secrets: Audiobookshelf URL and API key.
+.env
+
+# Logs: forge.log is the app's own log, cron.log is the nightly run's.
+*.log
+
+# Python bytecode.
+__pycache__/
+*.py[cod]
+
+# The live config, which holds machine-specific paths.  config.sample.ini is
+# the one that belongs in the repo.
+config.ini
+config.new.ini
+
+# Editor and OS droppings.
+*.swp
+*~
+.DS_Store

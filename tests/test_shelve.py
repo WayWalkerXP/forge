@@ -1,0 +1,555 @@
+"""Filing finished books into the library.
+
+The naming tests are the important ones: the live library was built by absmove,
+and a sanitiser that normalises differently would file the same author under a
+second folder and split books Audiobookshelf currently shows as one.  Every
+expected value here was taken from what is actually on disk.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from tests.helpers import TempCaseMixin, copy_audio, requires_ffmpeg, write_config
+from tests.test_library import FakeSession
+
+from forge import config as config_mod
+from forge import shelve as shelve_mod
+from forge import tags
+from forge.errors import ConfigError
+from forge.history import History
+from forge.shelve import ShelveOutcome, ShelveStatus
+from forge.tags import BookMetadata
+
+
+def meta(**fields) -> BookMetadata:
+    return BookMetadata(path="/nowhere.m4b", **fields)
+
+
+class LibraryComponentNames(unittest.TestCase):
+    """What absmove put on disk, which forge must keep putting there."""
+
+    def test_a_colon_becomes_an_underscore(self) -> None:
+        # /media/audiobooks/Audiobooks/Bill Oakley/Space_ 1969 & 1972
+        self.assertEqual(shelve_mod.library_component("Space: 1969 & 1972"), "Space_ 1969 & 1972")
+
+    def test_quotes_become_underscores(self) -> None:
+        # /media/audiobooks/Audiobooks/E.E. _Doc_ Smith, Reed McColm
+        self.assertEqual(
+            shelve_mod.library_component('E.E. "Doc" Smith, Reed McColm'),
+            "E.E. _Doc_ Smith, Reed McColm",
+        )
+
+    def test_a_slash_becomes_an_underscore(self) -> None:
+        self.assertEqual(shelve_mod.library_component("Star Trek / Voyager"), "Star Trek _ Voyager")
+
+    def test_runs_of_spaces_are_not_collapsed(self) -> None:
+        # paths.sanitize_filename collapses them; this must not, or a folder
+        # created earlier stops matching.
+        self.assertEqual(shelve_mod.library_component("A  B"), "A  B")
+
+    def test_a_trailing_dot_is_dropped(self) -> None:
+        self.assertEqual(shelve_mod.library_component("The End."), "The End")
+
+    def test_a_reserved_name_is_prefixed(self) -> None:
+        self.assertEqual(shelve_mod.library_component("NUL"), "_NUL")
+
+    def test_an_empty_component_is_never_empty(self) -> None:
+        for value in ("", "   ", None, ":::"):
+            self.assertTrue(shelve_mod.library_component(value))
+
+    def test_a_long_author_folder_already_in_the_library_is_preserved(self) -> None:
+        # The library holds a 207-byte fourteen-author folder.  Capping at
+        # forge's narrower output budget would file its next book under a new,
+        # truncated name beside it.
+        fourteen = ", ".join(f"Author Number {n:02d} Of Many" for n in range(1, 9))
+        self.assertGreater(len(fourteen.encode()), 200)
+        self.assertEqual(shelve_mod.library_component(fourteen), fourteen)
+
+    def test_a_component_is_never_longer_than_a_filesystem_allows(self) -> None:
+        capped = shelve_mod.library_component("x" * 400)
+        self.assertEqual(len(capped.encode()), shelve_mod.MAX_LIBRARY_COMPONENT)
+
+    def test_a_series_part_is_padded_to_two_digits(self) -> None:
+        self.assertEqual(shelve_mod.format_series_part("3"), "03")
+        self.assertEqual(shelve_mod.format_series_part(3), "03")
+        self.assertEqual(shelve_mod.format_series_part("12"), "12")
+
+    def test_a_non_numeric_part_is_left_alone(self) -> None:
+        self.assertEqual(shelve_mod.format_series_part("1.5"), "1.5")
+        self.assertEqual(shelve_mod.format_series_part("Prequel"), "Prequel")
+        self.assertEqual(shelve_mod.format_series_part(""), "")
+
+
+class LibraryPaths(unittest.TestCase):
+    root = Path("/library")
+
+    def test_the_full_shape(self) -> None:
+        path = shelve_mod.library_path(
+            self.root,
+            meta(
+                author="Jonathan Brooks",
+                album="The Affinity Collector 3",
+                series="Octaeteris Cycle",
+                series_sequence="3",
+                published_year=2026,
+                asin="B0HM2FPY5F",
+            ),
+        )
+        self.assertEqual(
+            path,
+            self.root
+            / "Jonathan Brooks"
+            / "Octaeteris Cycle"
+            / "03 - The Affinity Collector 3"
+            / "The Affinity Collector 3 (2026) [B0HM2FPY5F].m4b",
+        )
+
+    def test_no_series_means_no_series_folder_and_no_part_prefix(self) -> None:
+        path = shelve_mod.library_path(
+            self.root, meta(author="Adrian Tchaikovsky", album="Ironclads", published_year=2017)
+        )
+        self.assertEqual(
+            path, self.root / "Adrian Tchaikovsky" / "Ironclads" / "Ironclads (2017).m4b"
+        )
+
+    def test_no_year_and_no_asin(self) -> None:
+        path = shelve_mod.library_path(self.root, meta(author="A", album="B"))
+        self.assertEqual(path, self.root / "A" / "B" / "B.m4b")
+
+    def test_the_year_falls_back_to_the_published_date(self) -> None:
+        path = shelve_mod.library_path(
+            self.root, meta(author="A", album="B", published_date="2019-04-02")
+        )
+        self.assertEqual(path.name, "B (2019).m4b")
+
+    def test_the_author_folder_is_the_cleaned_author(self) -> None:
+        path = shelve_mod.library_path(
+            self.root, meta(author="Mary Smith - Translator, Bob Jones", album="B")
+        )
+        self.assertEqual(path.parts[2], "Bob Jones")
+
+    def test_the_album_artist_is_used_when_there_is_no_author(self) -> None:
+        path = shelve_mod.library_path(self.root, meta(albumartist="A A", album="B"))
+        self.assertEqual(path.parts[2], "A A")
+
+    def test_the_suffix_is_kept(self) -> None:
+        path = shelve_mod.library_path(self.root, meta(author="A", album="B"), suffix=".m4a")
+        self.assertEqual(path.suffix, ".m4a")
+
+    def test_a_very_long_title_still_fits_a_filesystem_component(self) -> None:
+        path = shelve_mod.library_path(self.root, meta(author="A", album="x" * 300))
+        for part in path.parts:
+            self.assertLessEqual(len(part.encode("utf-8")), 255, part)
+
+    def test_a_long_filename_leaves_room_for_a_collision_marker(self) -> None:
+        # Otherwise resolving a collision would produce a name too long to
+        # write, turning a shelving into a failure at the last step.
+        path = shelve_mod.library_path(self.root, meta(author="A", album="x" * 300))
+        self.assertLessEqual(len(f"{path.stem} (999){path.suffix}".encode()), 255)
+
+
+class CleaningAuthors(unittest.TestCase):
+    def test_a_role_credit_is_dropped(self) -> None:
+        for role in shelve_mod.AUTHOR_ROLE_SUFFIXES:
+            self.assertEqual(
+                shelve_mod.clean_author(f"Bob Jones, Mary Smith - {role.title()}"), "Bob Jones"
+            )
+
+    def test_stacked_roles_are_dropped(self) -> None:
+        self.assertEqual(
+            shelve_mod.clean_author("Bob Jones, Julia Fouche - Translator and Editor"),
+            "Bob Jones",
+        )
+        self.assertEqual(
+            shelve_mod.clean_author("Bob Jones, Julia Fouche - Translator/Editor"), "Bob Jones"
+        )
+
+    def test_a_leftover_bare_role_is_dropped(self) -> None:
+        self.assertEqual(
+            shelve_mod.clean_author("Bob Jones, Julia Fouche - Translator, Editor"), "Bob Jones"
+        )
+
+    def test_aka_names_both_count(self) -> None:
+        self.assertEqual(
+            shelve_mod.clean_author("Tom Clancy aka Jim Jones"), "Tom Clancy, Jim Jones"
+        )
+
+    def test_a_hyphenated_surname_is_not_touched(self) -> None:
+        # The reason the roles are an explicit list rather than "drop anything
+        # after a dash".
+        self.assertEqual(shelve_mod.clean_author("Mary Smith - Jones"), "Mary Smith - Jones")
+
+    def test_an_author_who_is_only_a_credit_is_kept(self) -> None:
+        # Better a shelf named after the editor than no author at all.
+        self.assertEqual(shelve_mod.clean_author("Mary Smith - Editor"), "Mary Smith - Editor")
+
+    def test_an_ordinary_author_is_unchanged(self) -> None:
+        self.assertEqual(shelve_mod.clean_author("Jonathan Brooks"), "Jonathan Brooks")
+
+    def test_nothing_in_nothing_out(self) -> None:
+        self.assertEqual(shelve_mod.clean_author(None), "")
+        self.assertEqual(shelve_mod.clean_author(""), "")
+
+
+class ShelveCase(TempCaseMixin, unittest.TestCase):
+    """A config with a library, and books in the output directory."""
+
+    SHELVED_ASIN = "B0CMYXVB65"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.library = self.root / "library"
+        self.library.mkdir(parents=True)
+        path = write_config(self.root, library_dir=self.library)
+        path.write_text(
+            path.read_text()
+            + "\n[audiobookshelf]\nurl = http://abs.invalid\napi_key = secret\n"
+        )
+        self.cfg = config_mod.load(path)
+        self.session = FakeSession()
+
+    def client(self):
+        from forge.library import AudiobookshelfClient
+
+        return AudiobookshelfClient(
+            "http://abs.invalid", "secret", session=self.session
+        )
+
+    def book(self, name: str, **fields) -> Path:
+        path = self.cfg.output_dir / name
+        copy_audio(path, seconds=1)
+        if fields:
+            tags.write_metadata(path, fields)
+        return path
+
+    def tree_hash(self, root: Path) -> list[tuple[str, str]]:
+        """Every file under *root*, with its digest.  For "changed nothing"."""
+
+        out = []
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                out.append(
+                    (str(path.relative_to(root)), hashlib.sha256(path.read_bytes()).hexdigest())
+                )
+        return out
+
+
+@requires_ffmpeg
+class Planning(ShelveCase):
+    def test_a_complete_book_is_ready(self) -> None:
+        path = self.book("book.m4b", author="A Author", album="A Book", series="S", series_sequence="2")
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertIs(plan.status, ShelveStatus.READY)
+        self.assertEqual(
+            plan.target, self.library / "A Author" / "S" / "02 - A Book" / "A Book.m4b"
+        )
+
+    def test_a_book_with_no_author_is_skipped(self) -> None:
+        path = self.book("no-author.m4b", album="A Book")
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertIs(plan.status, ShelveStatus.SKIPPED)
+        self.assertEqual(plan.category, "missing author")
+
+    def test_a_book_with_no_album_is_skipped(self) -> None:
+        path = self.book("no-album.m4b", author="A Author")
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertIs(plan.status, ShelveStatus.SKIPPED)
+        self.assertEqual(plan.category, "missing album")
+
+    def test_a_book_credited_only_to_an_editor_still_has_an_author(self) -> None:
+        path = self.book("edited.m4b", author="Mary Smith - Editor", album="A Book")
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertIs(plan.status, ShelveStatus.READY)
+
+    def test_a_book_with_no_asin_is_shelved_without_asking_the_library(self) -> None:
+        path = self.book("no-asin.m4b", author="A", album="B")
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertIs(plan.status, ShelveStatus.READY)
+        self.assertEqual(self.session.calls, [])
+
+    def test_a_shelved_asin_is_a_duplicate(self) -> None:
+        path = self.book("dupe.m4b", author="A", album="B", asin=self.SHELVED_ASIN)
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertIs(plan.status, ShelveStatus.DUPLICATE)
+        self.assertEqual(plan.duplicate_of.title, "Ironclads")
+
+    def test_a_library_that_cannot_be_reached_blocks_rather_than_shelves(self) -> None:
+        # Without an answer there is no way to tell a new book from a second
+        # copy, and guessing wrong puts a duplicate in the library.
+        import requests
+
+        self.session.get = mock.Mock(side_effect=requests.ConnectionError("no route"))
+        path = self.book("unknown.m4b", author="A", album="B", asin="B000000000")
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertIs(plan.status, ShelveStatus.SKIPPED)
+        self.assertEqual(plan.category, "library error")
+
+    def test_the_tag_fixes_are_planned_not_applied(self) -> None:
+        path = self.book(
+            "fixable.m4b", author="Bob Jones, Mary Smith - Translator", album="B", track=1
+        )
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertEqual(plan.tag_fixes, {"author": "Bob Jones", "track": None})
+        after = tags.read_metadata(path)
+        self.assertEqual(after.author, "Bob Jones, Mary Smith - Translator")
+        self.assertEqual(after.track, 1)
+
+    def test_two_books_cannot_claim_the_same_destination(self) -> None:
+        first = self.book("one.m4b", author="A", album="B")
+        second = self.book("two.m4b", author="A", album="B")
+        plans = shelve_mod.plan_many([first, second], self.cfg, client=self.client())
+        self.assertNotEqual(plans[0].target, plans[1].target)
+        self.assertEqual(plans[1].target.name, "B (2).m4b")
+
+    def test_an_existing_library_file_is_not_a_destination(self) -> None:
+        existing = self.library / "A" / "B" / "B.m4b"
+        existing.parent.mkdir(parents=True)
+        existing.write_bytes(b"already here")
+        path = self.book("book.m4b", author="A", album="B")
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertEqual(plan.target.name, "B (2).m4b")
+
+
+@requires_ffmpeg
+class Executing(ShelveCase):
+    def shelve(self, path: Path, **kwargs):
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        return shelve_mod.execute(plan, self.cfg, **kwargs)
+
+    def test_a_book_is_moved_into_the_library(self) -> None:
+        path = self.book("book.m4b", author="A Author", album="A Book")
+        result = self.shelve(path)
+        self.assertIs(result.outcome, ShelveOutcome.SHELVED)
+        self.assertTrue(result.destination.is_file())
+        self.assertFalse(path.exists(), "the original was left in the output directory")
+
+    def test_the_move_is_recorded_in_history(self) -> None:
+        path = self.book("book.m4b", author="A Author", album="A Book")
+        result = self.shelve(path)
+        with History(self.cfg.db_path) as store:
+            group = store.group(result.group_id)
+            changes = store.changes_in_group(result.group_id)
+        self.assertEqual(group.source, "shelve")
+        paths = {c.field: (c.old_value, c.new_value) for c in changes}
+        self.assertIn("path", paths)
+        self.assertEqual(paths["path"][1], str(result.destination))
+
+    def test_the_recorded_move_is_not_something_undo_would_write(self) -> None:
+        # "path" is in UNRESTORABLE_FIELDS, so the move shows in history while
+        # undo leaves it alone instead of writing a tag called "path".
+        path = self.book("book.m4b", author="A Author", album="A Book")
+        result = self.shelve(path)
+        with History(self.cfg.db_path) as store:
+            restore = store.restore_values(result.group_id)
+        for fields in restore.values():
+            self.assertNotIn("path", fields)
+
+    def test_the_tag_fixes_are_applied_and_undoable(self) -> None:
+        path = self.book(
+            "fixable.m4b", author="Bob Jones, Mary Smith - Translator", album="A Book", track=3
+        )
+        result = self.shelve(path)
+        shelved = tags.read_metadata(result.destination)
+        self.assertEqual(shelved.author, "Bob Jones")
+        self.assertIsNone(shelved.track)
+
+        # One edit, one group: the move and both fixes undo together.
+        with History(self.cfg.db_path) as store:
+            restore = store.restore_values(result.group_id)
+        fields = next(iter(restore.values()))
+        self.assertEqual(fields["author"], "Bob Jones, Mary Smith - Translator")
+        self.assertEqual(fields["track"], "3")
+
+    def test_the_change_log_follows_the_file_into_the_library(self) -> None:
+        # Recorded against the output directory, which the book then leaves.
+        # Asking about it where it now lives must show the tag edits, and an
+        # undo must write to the file that is actually there.
+        path = self.book(
+            "fixable.m4b", author="Bob Jones, Mary Smith - Translator", album="A Book", track=3
+        )
+        result = self.shelve(path)
+        with History(self.cfg.db_path) as store:
+            groups = store.groups_for_file(result.destination)
+            restore = store.restore_values(result.group_id)
+        self.assertEqual([g.id for g in groups], [result.group_id])
+        self.assertEqual(list(restore), [str(result.destination)])
+        self.assertNotIn(str(path), restore)
+
+    def test_one_group_covers_the_edit_and_the_move(self) -> None:
+        path = self.book(
+            "fixable.m4b", author="Bob Jones, Mary Smith - Translator", album="A Book", track=3
+        )
+        result = self.shelve(path)
+        with History(self.cfg.db_path) as store:
+            groups = store.groups_for_book(result.plan.book_key)
+            fields = {c.field for c in store.changes_in_group(result.group_id)}
+        self.assertEqual(len(groups), 1, "shelving one book recorded more than one group")
+        self.assertEqual(groups[0].description, "shelved")
+        self.assertEqual(fields, {"author", "track", "path"})
+
+    def test_a_duplicate_is_set_aside_and_never_enters_the_library(self) -> None:
+        path = self.book("dupe.m4b", author="A", album="B", asin=self.SHELVED_ASIN)
+        result = self.shelve(path)
+        self.assertIs(result.outcome, ShelveOutcome.SET_ASIDE)
+        self.assertEqual(result.destination.parent, self.cfg.output_dir / "duplicates")
+        self.assertTrue(result.destination.is_file())
+        self.assertFalse(path.exists())
+        self.assertEqual(list(self.library.rglob("*.m4b")), [])
+
+    def test_setting_aside_is_recorded_with_the_asin_that_matched(self) -> None:
+        path = self.book("dupe.m4b", author="A", album="B", asin=self.SHELVED_ASIN)
+        result = self.shelve(path)
+        with History(self.cfg.db_path) as store:
+            group = store.group(result.group_id)
+        self.assertIn(self.SHELVED_ASIN, group.description)
+
+    def test_a_skipped_book_is_left_exactly_where_it_was(self) -> None:
+        path = self.book("no-author.m4b", album="B")
+        before = path.read_bytes()
+        result = self.shelve(path)
+        self.assertIs(result.outcome, ShelveOutcome.SKIPPED)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_nothing_is_overwritten(self) -> None:
+        existing = self.library / "A" / "B" / "B.m4b"
+        existing.parent.mkdir(parents=True)
+        existing.write_bytes(b"already here")
+        path = self.book("book.m4b", author="A", album="B")
+        result = self.shelve(path)
+        self.assertEqual(existing.read_bytes(), b"already here")
+        self.assertEqual(result.destination.name, "B (2).m4b")
+
+    def test_a_dry_run_changes_nothing_at_all(self) -> None:
+        self.book("book.m4b", author="A Author", album="A Book", track=2)
+        self.book("dupe.m4b", author="A", album="B", asin=self.SHELVED_ASIN)
+        before_out = self.tree_hash(self.cfg.output_dir)
+        before_lib = self.tree_hash(self.library)
+
+        paths, _ = shelve_mod.find_books(self.cfg.output_dir)
+        plans = shelve_mod.plan_many(paths, self.cfg, client=self.client())
+        results = [shelve_mod.execute(p, self.cfg, dry_run=True) for p in plans]
+
+        self.assertEqual(self.tree_hash(self.cfg.output_dir), before_out)
+        self.assertEqual(self.tree_hash(self.library), before_lib)
+        # And it still says what it would have done.
+        self.assertEqual(
+            {r.outcome for r in results}, {ShelveOutcome.SHELVED, ShelveOutcome.SET_ASIDE}
+        )
+
+    def test_a_cross_device_move_falls_back_to_a_verified_copy(self) -> None:
+        import errno
+
+        from forge import archive
+
+        real_link = archive.os.link
+        calls: list[int] = []
+
+        def fake_link(src, dst):
+            calls.append(1)
+            raise OSError(errno.EXDEV, "cross-device link")
+
+        path = self.book("book.m4b", author="A Author", album="A Book")
+        with mock.patch.object(archive.os, "link", fake_link):
+            result = self.shelve(path)
+
+        self.assertTrue(calls, "the fast path was never attempted")
+        self.assertIs(result.outcome, ShelveOutcome.SHELVED)
+        self.assertTrue(result.destination.is_file())
+        self.assertFalse(path.exists())
+        self.assertIsNotNone(real_link)
+
+    def test_a_failed_move_reports_a_failure_and_keeps_the_book(self) -> None:
+        from forge import shelve as module
+
+        path = self.book("book.m4b", author="A Author", album="A Book")
+        with mock.patch.object(
+            module, "move_into_library", side_effect=OSError("disk fell over")
+        ):
+            result = self.shelve(path)
+        self.assertIs(result.outcome, ShelveOutcome.FAILED)
+        self.assertEqual(result.category, "move error")
+        self.assertTrue(path.is_file())
+
+
+@requires_ffmpeg
+class FindingBooks(ShelveCase):
+    def test_only_m4b_files_are_candidates(self) -> None:
+        self.book("book.m4b", author="A", album="B")
+        (self.cfg.output_dir / "cover.jpg").write_bytes(b"not audio")
+        (self.cfg.output_dir / "notes.txt").write_text("hello")
+        found, pending = shelve_mod.find_books(self.cfg.output_dir)
+        self.assertEqual([p.name for p in found], ["book.m4b"])
+        self.assertEqual(pending, [])
+
+    def test_a_conversion_in_progress_is_left_alone(self) -> None:
+        self.book("J.R. Mathews - Portal.tmp.m4b", author="A", album="B")
+        found, pending = shelve_mod.find_books(self.cfg.output_dir)
+        self.assertEqual(found, [])
+        self.assertEqual(len(pending), 1)
+
+    def test_the_duplicates_directory_is_not_rescanned(self) -> None:
+        duplicates = self.cfg.output_dir / "duplicates"
+        self.book("duplicates/set-aside.m4b", author="A", album="B")
+        self.book("book.m4b", author="A", album="B")
+        found, _ = shelve_mod.find_books(self.cfg.output_dir, exclude=[duplicates])
+        self.assertEqual([p.name for p in found], ["book.m4b"])
+
+    def test_nested_directories_are_searched(self) -> None:
+        self.book("sub/deeper/book.m4b", author="A", album="B")
+        found, _ = shelve_mod.find_books(self.cfg.output_dir)
+        self.assertEqual([p.name for p in found], ["book.m4b"])
+
+
+class LibraryConfiguration(TempCaseMixin, unittest.TestCase):
+    def test_no_library_dir_is_allowed(self) -> None:
+        cfg = config_mod.load(write_config(self.root))
+        self.assertFalse(cfg.can_shelve)
+        self.assertIsNone(cfg.library_dir)
+
+    def test_a_library_dir_that_does_not_exist_is_refused(self) -> None:
+        # Never created: a typo must fail loudly rather than quietly start
+        # filling a second, empty library beside the real one.
+        path = write_config(self.root, library_dir=self.root / "typo")
+        with self.assertRaises(ConfigError) as caught:
+            config_mod.load(path)
+        self.assertIn("library_dir does not exist", str(caught.exception))
+
+    def test_a_library_inside_the_source_tree_is_refused(self) -> None:
+        library = self.root / "src" / "library"
+        library.mkdir(parents=True)
+        with self.assertRaises(ConfigError):
+            config_mod.load(write_config(self.root, library_dir=library))
+
+    def test_a_library_that_contains_the_output_directory_is_refused(self) -> None:
+        library = self.root
+        with self.assertRaises(ConfigError):
+            config_mod.load(write_config(self.root, library_dir=library))
+
+    def test_duplicates_inside_the_library_are_refused(self) -> None:
+        library = self.root / "library"
+        library.mkdir()
+        path = write_config(
+            self.root, library_dir=library, duplicates_dir=library / "duplicates"
+        )
+        with self.assertRaises(ConfigError):
+            config_mod.load(path)
+
+    def test_duplicates_without_a_library_is_refused(self) -> None:
+        with self.assertRaises(ConfigError):
+            config_mod.load(write_config(self.root, duplicates_dir=self.root / "dupes"))
+
+    def test_the_default_duplicates_directory_sits_beside_the_books(self) -> None:
+        library = self.root / "library"
+        library.mkdir()
+        cfg = config_mod.load(write_config(self.root, library_dir=library))
+        self.assertEqual(
+            cfg.duplicates_for(cfg.output_dir), cfg.output_dir / "duplicates"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

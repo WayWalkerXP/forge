@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""forge entry point.
+
+Deliberately thin, and deliberately not a console_script: forge runs from the
+system interpreter with no virtual environment, so that an unattended cron job
+needs nothing activated.  This script only puts the package on the path and
+hands over to the CLI.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from forge.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())
