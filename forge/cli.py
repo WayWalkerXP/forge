@@ -1192,6 +1192,11 @@ def cmd_authors(args: argparse.Namespace) -> int:
             renderer.info(f"  written as: {registry.canonical_name(args.name)!r}")
             for spelling in registry.aliases_of(asin):
                 renderer.info(f"  also seen as: {spelling!r}")
+            known = registry.asins_of(asin)
+            if known:
+                renderer.info(f"  Audible ASIN(s): {', '.join(known)}")
+            else:
+                renderer.info("  Audible has no contributor ASIN for this author")
             return EXIT_OK
 
         unknown = registry.unknown_names()
@@ -1207,16 +1212,24 @@ def cmd_authors(args: argparse.Namespace) -> int:
         stats = registry.stats()
         renderer.info(
             f"{stats['authors']} author(s), {stats['aliases']} spelling(s), "
-            f"{stats['unknown']} unplaced"
+            f"{stats['asins']} Audible id(s), {stats['unknown']} unplaced"
         )
-        multiple = [row for row in registry.identities() if row[2] > 1]
+        multiple = [
+            row
+            for row in registry.identities()
+            if row[2] > 1 or len(registry.asins_of(row[0])) > 1
+        ]
         if multiple:
             renderer.info("")
-            renderer.info("authors Amazon spells more than one way:")
-            for asin, name, count in multiple[: args.limit]:
-                spellings = ", ".join(repr(s) for s in registry.aliases_of(asin))
-                renderer.info(f"  {name}  ({count}) {asin}")
-                renderer.info(f"      {spellings}")
+            renderer.info("authors Amazon records more than one way:")
+            for identity, name, count in multiple[: args.limit]:
+                renderer.info(f"  {name}  {identity}")
+                spellings = ", ".join(repr(s) for s in registry.aliases_of(identity))
+                if count > 1:
+                    renderer.info(f"      spelled: {spellings}")
+                asins = registry.asins_of(identity)
+                if len(asins) > 1:
+                    renderer.info(f"      {len(asins)} contributor ids: {', '.join(asins)}")
         if unknown:
             renderer.info("")
             renderer.info(

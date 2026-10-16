@@ -200,8 +200,12 @@ tag "J.N. Chaney"    → B00W2ZAK7E
 
 So identity is a lookup, not a guess. `forge/authors.py` keeps the answers in
 its own SQLite file (`state_dir/authors.sqlite3`): an `author` table of
-identities, and an `author_alias` table mapping every spelling ever seen to one
-of them. `shelve` resolves each contributor through it, writes the canonical
+identities, an `author_alias` table mapping every spelling ever seen to one of
+them, and an `author_asin` table holding every Audible contributor id that
+turned out to be the same person — because Amazon issues several. It keeps
+three contributor records for David Baldacci, so three lookups of his books
+produce three ids for one author; they are folded onto one identity rather than
+splitting his shelf three ways. `shelve` resolves each contributor through it, writes the canonical
 spelling into the tag — so ABS indexes one author — and files the book under
 that name, so the folder follows the tag rather than being fixed separately.
 
@@ -258,7 +262,7 @@ that rewrite is the mechanism working.
 | command | what it does |
 |---|---|
 | `forge authors` | what the registry knows, and which authors Amazon spells more than one way |
-| `forge authors "JN Chaney"` | the identity behind one spelling, and its other spellings |
+| `forge authors "JN Chaney"` | the identity behind one spelling, its other spellings, and its Audible ids |
 | `forge authors --unknown` | spellings it could not place |
 | `forge authors --link "Brandon Morris" B01N7UFRX4` | declare a spelling to be a known author (an ASIN, or a `name:` identity) |
 | `forge authors --rename B00W2ZAK7E "J. N. Chaney"` | change how an author is written |

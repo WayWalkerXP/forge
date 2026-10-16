@@ -44,7 +44,7 @@ from typing import Iterable, Iterator, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -57,10 +57,21 @@ CREATE TABLE IF NOT EXISTS schema_info (
 -- catalogue: Amazon returns their name with no id at all.
 CREATE TABLE IF NOT EXISTS author (
     author_id      TEXT PRIMARY KEY,
-    audible_asin   TEXT,
     canonical_name TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
+
+-- Every Audible ASIN that turns out to be this author.  One person, several
+-- ids: Amazon keeps three contributor records for David Baldacci, and three
+-- lookups of his books produced three identities, two of them unreachable
+-- because the alias table can only point one name at one of them.
+CREATE TABLE IF NOT EXISTS author_asin (
+    asin       TEXT PRIMARY KEY,
+    author_id  TEXT NOT NULL REFERENCES author(author_id) ON DELETE CASCADE,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS author_asin_by_author ON author_asin (author_id);
 
 CREATE TABLE IF NOT EXISTS author_alias (
     name_key    TEXT PRIMARY KEY,
@@ -230,6 +241,7 @@ class AuthorRegistry:
 
     def _migrate(self) -> None:
         self._upgrade_from_v1()
+        self._upgrade_from_v2()
         self._create_tables()
         row = self._connection.execute("SELECT version FROM schema_info").fetchone()
         if row is None:
@@ -267,7 +279,21 @@ class AuthorRegistry:
         try:
             self._connection.execute("DROP TABLE author_alias")
             self._connection.execute("DROP TABLE author")
-            self._create_tables()
+            self._connection.execute(
+                "CREATE TABLE author ("
+                " author_id TEXT PRIMARY KEY,"
+                " audible_asin TEXT,"
+                " canonical_name TEXT NOT NULL,"
+                " updated_at TEXT NOT NULL)"
+            )
+            self._connection.execute(
+                "CREATE TABLE author_alias ("
+                " name_key TEXT PRIMARY KEY,"
+                " author_id TEXT NOT NULL REFERENCES author(author_id) ON DELETE CASCADE,"
+                " spelling TEXT NOT NULL,"
+                " source TEXT NOT NULL,"
+                " updated_at TEXT NOT NULL)"
+            )
             for row in authors:
                 self._connection.execute(
                     "INSERT INTO author (author_id, audible_asin, canonical_name, updated_at) "
@@ -282,6 +308,88 @@ class AuthorRegistry:
                     "VALUES (?, ?, ?, ?, ?) ON CONFLICT (name_key) DO NOTHING",
                     (name_key(row["spelling"]), row["author_asin"], row["spelling"],
                      row["source"], row["updated_at"]),
+                )
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
+
+    def _upgrade_from_v2(self) -> None:
+        """Fold duplicate identities for one author into one, with many ASINs.
+
+        v2 keyed an identity by a single ASIN, on the assumption that Amazon
+        issues one per person.  It issues several: three lookups of David
+        Baldacci's books made three identities, and because the alias table
+        keys on the name, two of them were left with nothing pointing at them.
+
+        Folding them loses nothing the registry could express - two authors
+        with a byte-identical name were already indistinguishable through the
+        alias table - and it means a later pass can group a library by identity
+        without splitting one author across three shelves.
+        """
+
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(author)").fetchall()
+        }
+        if "audible_asin" not in columns:
+            return
+
+        LOGGER.info("upgrading the author registry from schema version 2")
+        authors = self._connection.execute(
+            "SELECT author_id, audible_asin, canonical_name, updated_at FROM author"
+        ).fetchall()
+        aliases = self._connection.execute(
+            "SELECT name_key, author_id, spelling, source, updated_at FROM author_alias"
+        ).fetchall()
+
+        reachable = {row["author_id"] for row in aliases}
+        # Which identity owns each name, so an orphan can be folded into it.
+        by_key = {row["name_key"]: row["author_id"] for row in aliases}
+
+        keep: list[tuple[str, str, str]] = []
+        asins: list[tuple[str, str, str]] = []
+        for row in authors:
+            identity = row["author_id"]
+            target = identity
+            if identity not in reachable:
+                target = by_key.get(name_key(row["canonical_name"]), identity)
+            if target == identity:
+                keep.append((identity, row["canonical_name"], row["updated_at"]))
+            else:
+                LOGGER.info(
+                    "folding duplicate identity %s into %s (%s)",
+                    identity,
+                    target,
+                    row["canonical_name"],
+                )
+            if row["audible_asin"]:
+                asins.append((row["audible_asin"], target, row["updated_at"]))
+
+        self._connection.execute("BEGIN")
+        try:
+            self._connection.execute("DROP TABLE author_alias")
+            self._connection.execute("DROP TABLE author")
+            self._create_tables()
+            for identity, name, updated in keep:
+                self._connection.execute(
+                    "INSERT INTO author (author_id, canonical_name, updated_at) "
+                    "VALUES (?, ?, ?)",
+                    (identity, name, updated),
+                )
+            for row in aliases:
+                self._connection.execute(
+                    "INSERT INTO author_alias "
+                    "(name_key, author_id, spelling, source, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (row["name_key"], row["author_id"], row["spelling"], row["source"],
+                     row["updated_at"]),
+                )
+            for asin, identity, updated in asins:
+                self._connection.execute(
+                    "INSERT INTO author_asin (asin, author_id, updated_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT (asin) DO NOTHING",
+                    (asin, identity, updated),
                 )
         except Exception:
             self._connection.execute("ROLLBACK")
@@ -310,13 +418,23 @@ class AuthorRegistry:
             key = name_key(contributor.name)
             if not key:
                 continue
-            identity = contributor.identity
+
+            # An identity this author already has wins over making a new one,
+            # by the name first and then by the ASIN.  Amazon issues several
+            # contributor ids for one person, so a second id is another way of
+            # naming someone already known, not another person.
+            identity = self.identity(contributor.name)
+            if identity is None and contributor.asin:
+                identity = self.identity_for_asin(contributor.asin)
+            if identity is None:
+                identity = contributor.identity
+                self._connection.execute(
+                    "INSERT INTO author (author_id, canonical_name, updated_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT (author_id) DO NOTHING",
+                    (identity, contributor.name.strip(), self._now()),
+                )
+
             kind = source if contributor.asin else SOURCE_AUDIBLE_NO_ASIN
-            self._connection.execute(
-                "INSERT INTO author (author_id, audible_asin, canonical_name, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT (author_id) DO NOTHING",
-                (identity, contributor.asin or None, contributor.name.strip(), self._now()),
-            )
             cursor = self._connection.execute(
                 "INSERT INTO author_alias "
                 "(name_key, author_id, spelling, source, updated_at) "
@@ -324,6 +442,12 @@ class AuthorRegistry:
                 (key, identity, contributor.name.strip(), kind, self._now()),
             )
             learned += cursor.rowcount or 0
+            if contributor.asin:
+                self._connection.execute(
+                    "INSERT INTO author_asin (asin, author_id, updated_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT (asin) DO NOTHING",
+                    (contributor.asin, identity, self._now()),
+                )
             self._connection.execute("DELETE FROM author_unknown WHERE name_key = ?", (key,))
         return learned
 
@@ -349,15 +473,15 @@ class AuthorRegistry:
                     f"{author_id} is not a known author; pass canonical_name to create it"
                 )
             self._connection.execute(
-                "INSERT INTO author (author_id, audible_asin, canonical_name, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    author_id,
-                    None if author_id.startswith("name:") else author_id,
-                    canonical_name.strip(),
-                    self._now(),
-                ),
+                "INSERT INTO author (author_id, canonical_name, updated_at) VALUES (?, ?, ?)",
+                (author_id, canonical_name.strip(), self._now()),
             )
+            if not author_id.startswith("name:"):
+                self._connection.execute(
+                    "INSERT INTO author_asin (asin, author_id, updated_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT (asin) DO NOTHING",
+                    (author_id, author_id, self._now()),
+                )
         elif canonical_name:
             self.rename(author_id, canonical_name)
         self._connection.execute(
@@ -405,6 +529,23 @@ class AuthorRegistry:
             "SELECT author_id FROM author_alias WHERE name_key = ?", (name_key(name),)
         ).fetchone()
         return row["author_id"] if row else None
+
+    def identity_for_asin(self, asin: str) -> str | None:
+        """The identity an Audible contributor ASIN belongs to."""
+
+        row = self._connection.execute(
+            "SELECT author_id FROM author_asin WHERE asin = ?", (asin,)
+        ).fetchone()
+        return row["author_id"] if row else None
+
+    def asins_of(self, author_id: str) -> list[str]:
+        """Every Audible contributor ASIN that turned out to be this author."""
+
+        rows = self._connection.execute(
+            "SELECT asin FROM author_asin WHERE author_id = ? ORDER BY asin",
+            (author_id,),
+        ).fetchall()
+        return [row["asin"] for row in rows]
 
     def canonical_name(self, name: str) -> str | None:
         """How this author should be written, if the registry knows them."""
@@ -480,5 +621,6 @@ class AuthorRegistry:
         return {
             "authors": count("author"),
             "aliases": count("author_alias"),
+            "asins": count("author_asin"),
             "unknown": count("author_unknown"),
         }

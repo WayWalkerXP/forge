@@ -7,6 +7,7 @@ import unittest
 from tests.helpers import TempCaseMixin
 
 from forge.authors import (
+    SCHEMA_VERSION,
     AuthorRegistry,
     Contributor,
     join_authors,
@@ -128,6 +129,134 @@ class SchemaUpgrade(TempCaseMixin, unittest.TestCase):
             self.assertEqual(registry.identity("JN Chaney"), "B00W2ZAK7E")
 
 
+class FoldingDuplicateIdentities(TempCaseMixin, unittest.TestCase):
+    """A v2 registry had one identity per ASIN; one author can have several."""
+
+    def v2_database(self):
+        import sqlite3
+
+        path = self.root / "authors.sqlite3"
+        connection = sqlite3.connect(str(path), isolation_level=None)
+        connection.executescript(
+            """
+            CREATE TABLE schema_info (version INTEGER NOT NULL);
+            CREATE TABLE author (
+                author_id      TEXT PRIMARY KEY,
+                audible_asin   TEXT,
+                canonical_name TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+            CREATE TABLE author_alias (
+                name_key    TEXT PRIMARY KEY,
+                author_id   TEXT NOT NULL REFERENCES author(author_id),
+                spelling    TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE TABLE author_unknown (
+                name_key   TEXT PRIMARY KEY,
+                spelling   TEXT NOT NULL,
+                seen       INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO schema_info VALUES (2);
+            -- the live registry's shape: three Baldaccis, one reachable
+            INSERT INTO author VALUES
+                ('B0H8QD5X57', 'B0H8QD5X57', 'David Baldacci', '2026-10-16T14:20:58+00:00'),
+                ('B0H12WK1DB', 'B0H12WK1DB', 'David Baldacci', '2026-10-16T14:22:09+00:00'),
+                ('B000AQ0STC', 'B000AQ0STC', 'David Baldacci', '2026-10-16T14:22:25+00:00'),
+                ('name:rhaegar', NULL, 'Rhaegar', '2026-10-16T14:39:53+00:00');
+            INSERT INTO author_alias VALUES
+                ('davidbaldacci', 'B0H8QD5X57', 'David Baldacci', 'audible',
+                 '2026-10-16T14:20:58+00:00'),
+                ('rhaegar', 'name:rhaegar', 'Rhaegar', 'audible-no-asin',
+                 '2026-10-16T14:39:53+00:00');
+            """
+        )
+        connection.close()
+        return path
+
+    def test_the_duplicates_become_one_author_with_three_asins(self) -> None:
+        with AuthorRegistry(self.v2_database()) as registry:
+            self.assertEqual(
+                [name for _, name, _ in registry.identities()],
+                ["David Baldacci", "Rhaegar"],
+            )
+            self.assertEqual(
+                registry.asins_of("B0H8QD5X57"),
+                ["B000AQ0STC", "B0H12WK1DB", "B0H8QD5X57"],
+            )
+
+    def test_nothing_is_left_unreachable(self) -> None:
+        with AuthorRegistry(self.v2_database()) as registry:
+            orphans = registry._connection.execute(
+                "SELECT author_id FROM author "
+                "WHERE author_id NOT IN (SELECT author_id FROM author_alias)"
+            ).fetchall()
+            self.assertEqual(orphans, [])
+
+    def test_resolution_is_unchanged_by_the_fold(self) -> None:
+        with AuthorRegistry(self.v2_database()) as registry:
+            self.assertEqual(registry.canonical_name("david baldacci"), "David Baldacci")
+            self.assertEqual(registry.identity("Rhaegar"), "name:rhaegar")
+
+    def test_a_folded_asin_still_identifies_its_author(self) -> None:
+        # A later book crediting the duplicate id must land on the same author.
+        with AuthorRegistry(self.v2_database()) as registry:
+            self.assertEqual(registry.identity_for_asin("B000AQ0STC"), "B0H8QD5X57")
+            registry.learn([Contributor("B000AQ0STC", "Baldacci, David")])
+            self.assertEqual(registry.identity("Baldacci, David"), "B0H8QD5X57")
+            self.assertEqual(registry.stats()["authors"], 2)
+
+    def test_an_author_with_no_asin_survives_the_fold(self) -> None:
+        with AuthorRegistry(self.v2_database()) as registry:
+            self.assertEqual(registry.asins_of("name:rhaegar"), [])
+            self.assertEqual(registry.canonical_name("rhaegar"), "Rhaegar")
+
+    def test_a_v1_registry_upgrades_all_the_way(self) -> None:
+        # Both steps in one open: v1 -> v2 -> v3.
+        import sqlite3
+
+        path = self.root / "chained.sqlite3"
+        connection = sqlite3.connect(str(path), isolation_level=None)
+        connection.executescript(
+            """
+            CREATE TABLE schema_info (version INTEGER NOT NULL);
+            CREATE TABLE author (
+                author_asin    TEXT PRIMARY KEY,
+                canonical_name TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+            CREATE TABLE author_alias (
+                name_key    TEXT PRIMARY KEY,
+                author_asin TEXT NOT NULL REFERENCES author(author_asin),
+                spelling    TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE TABLE author_unknown (
+                name_key TEXT PRIMARY KEY, spelling TEXT NOT NULL,
+                seen INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
+            );
+            INSERT INTO schema_info VALUES (1);
+            INSERT INTO author VALUES
+                ('B00W2ZAK7E', 'J.N. Chaney', '2026-10-16T00:00:00+00:00');
+            INSERT INTO author_alias VALUES
+                ('jnchaney', 'B00W2ZAK7E', 'J.N. Chaney', 'audible',
+                 '2026-10-16T00:00:00+00:00');
+            """
+        )
+        connection.close()
+
+        with AuthorRegistry(path) as registry:
+            self.assertEqual(registry.identity("JN Chaney"), "B00W2ZAK7E")
+            self.assertEqual(registry.asins_of("B00W2ZAK7E"), ["B00W2ZAK7E"])
+            row = registry._connection.execute(
+                "SELECT version FROM schema_info"
+            ).fetchone()
+            self.assertEqual(row["version"], SCHEMA_VERSION)
+
+
 class Registry(TempCaseMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -175,12 +304,11 @@ class Registry(TempCaseMixin, unittest.TestCase):
 
         self.registry.learn([Contributor(None, "X-RHODEN-X")])
         row = self.registry._connection.execute(
-            "SELECT source, audible_asin FROM author_alias "
-            "JOIN author USING (author_id) WHERE name_key = ?",
-            ("xrhodenx",),
+            "SELECT source FROM author_alias WHERE name_key = ?", ("xrhodenx",)
         ).fetchone()
         self.assertEqual(row["source"], SOURCE_AUDIBLE_NO_ASIN)
-        self.assertIsNone(row["audible_asin"])
+        # An author with no ASIN has no row in the ASIN table at all.
+        self.assertEqual(self.registry.asins_of("name:xrhodenx"), [])
 
     def test_an_accented_name_keys_the_same_either_way(self) -> None:
         # Amazon writes this author's surname both ways; the tag on the file
@@ -282,8 +410,48 @@ class Registry(TempCaseMixin, unittest.TestCase):
         self.registry.learn([Contributor(CHANEY, "Chaney, J.N.")])
         self.registry.note_unknown(["A Newcomer"])
         self.assertEqual(
-            self.registry.stats(), {"authors": 2, "aliases": 3, "unknown": 1}
+            self.registry.stats(),
+            {"authors": 2, "aliases": 3, "asins": 2, "unknown": 1},
         )
+
+    def test_a_second_asin_for_one_author_joins_the_identity_it_has(self) -> None:
+        # Amazon keeps three contributor records for David Baldacci; three
+        # lookups of his books used to make three identities, two of them with
+        # nothing pointing at them.
+        for asin in ("B0H8QD5X57", "B0H12WK1DB", "B000AQ0STC"):
+            self.registry.learn([Contributor(asin, "David Baldacci")])
+
+        self.assertEqual(self.registry.stats()["authors"], 1)
+        self.assertEqual(self.registry.identity("David Baldacci"), "B0H8QD5X57")
+        self.assertEqual(
+            self.registry.asins_of("B0H8QD5X57"),
+            ["B000AQ0STC", "B0H12WK1DB", "B0H8QD5X57"],
+        )
+
+    def test_every_identity_is_reachable_through_a_spelling(self) -> None:
+        for asin in ("B0H8QD5X57", "B0H12WK1DB"):
+            self.registry.learn([Contributor(asin, "David Baldacci")])
+        orphans = self.registry._connection.execute(
+            "SELECT author_id FROM author "
+            "WHERE author_id NOT IN (SELECT author_id FROM author_alias)"
+        ).fetchall()
+        self.assertEqual(orphans, [])
+
+    def test_an_asin_already_known_identifies_a_new_spelling(self) -> None:
+        # The other direction: same person, same ASIN, a name that reduces to a
+        # key the registry has not seen.
+        self.registry.learn([Contributor(CHANEY, "J.N. Chaney")])
+        self.registry.learn([Contributor(CHANEY, "Chaney, J.N.")])
+
+        self.assertEqual(self.registry.stats()["authors"], 1)
+        self.assertEqual(self.registry.identity("Chaney, J.N."), CHANEY)
+        # ...and it answers with the name it was first given.
+        self.assertEqual(self.registry.canonical_name("Chaney, J.N."), "J.N. Chaney")
+
+    def test_an_asin_belongs_to_one_identity_only(self) -> None:
+        self.registry.learn([Contributor(MORRIS, "Brandon Q. Morris")])
+        self.assertEqual(self.registry.identity_for_asin(MORRIS), MORRIS)
+        self.assertIsNone(self.registry.identity_for_asin("B000000000"))
 
     def test_identities_report_the_most_respelled_author_first(self) -> None:
         self.registry.learn([Contributor(CHANEY, "J.N. Chaney")])
