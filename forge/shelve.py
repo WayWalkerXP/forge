@@ -297,7 +297,14 @@ def library_path(
 # --------------------------------------------------------------------------- #
 
 
-def existing_case(parent: Path, name: str, *, author_set: bool = False) -> str | None:
+def existing_case(
+    parent: Path,
+    name: str,
+    *,
+    author_set: bool = False,
+    fold_case: bool = True,
+    registry: "authors_mod.AuthorRegistry | None" = None,
+) -> str | None:
     """The on-disk spelling of a directory called *name*, ignoring spelling.
 
     Returns None when no such directory exists.  An exact match always wins;
@@ -316,26 +323,96 @@ def existing_case(parent: Path, name: str, *, author_set: bool = False) -> str |
         entries = [entry.name for entry in parent.iterdir() if entry.is_dir()]
     except OSError:
         return None
+
+    # The collaboration check comes before an exact match, because a book whose
+    # own folder exists may still belong on a bigger shelf naming the same
+    # people in another order: one book in "Rick Partlow, J.N. Chaney" against
+    # thirteen in "J.N. Chaney, Rick Partlow".  Among candidates the fullest
+    # shelf wins, which keeps the books that move to a minimum, and the name
+    # breaks a tie so the answer does not depend on directory order.
+    # A registry is required: without one there is no canonical spelling to
+    # judge a candidate against, so folding by key alone would let a variant
+    # spelling capture the books it is supposed to lose.
+    if author_set and registry is not None:
+        same = [
+            entry
+            for entry in entries
+            if _same_collaboration(entry, name, registry=registry)
+        ]
+        if same:
+            return _fullest(parent, same)
+
+    if fold_case:
+        # Before an exact match, because when two case variants both exist the
+        # books have to end up in one of them, and the exact name is only one
+        # of the two.  This is what merges "Earth's First StarFighter" with
+        # "Earth's First Starfighter" rather than leaving each holding books
+        # that Windows cannot reach.
+        folded = name.casefold()
+        variants = [entry for entry in entries if entry.casefold() == folded]
+        if variants:
+            return _fullest(parent, variants)
+
     if name in entries:
         return name
-
-    folded = name.casefold()
-    variants = sorted(entry for entry in entries if entry.casefold() == folded)
-    if variants:
-        return variants[0]
-
-    if author_set:
-        wanted = authors_mod.shelf_key(name)
-        if wanted:
-            same = sorted(
-                entry for entry in entries if authors_mod.shelf_key(entry) == wanted
-            )
-            if same:
-                return same[0]
     return None
 
 
-def match_existing_case(root: Path, target: Path) -> Path:
+def _fullest(parent: Path, candidates: Sequence[str]) -> str:
+    """The candidate holding the most books; the name breaks a tie.
+
+    Fullest, so the fewest books have to move.  Alphabetical after that, which
+    is stable between runs and tends to prefer the capitalised spelling.
+    """
+
+    return sorted(candidates, key=lambda entry: (-_shelf_size(parent / entry), entry))[0]
+
+
+def _shelf_size(folder: Path) -> int:
+    """How many books a shelf holds, for choosing between two of them."""
+
+    try:
+        return sum(
+            1
+            for path in folder.rglob("*")
+            if path.suffix.casefold() in SHELVEABLE_EXTENSIONS
+        )
+    except OSError:
+        return 0
+
+
+def _same_collaboration(
+    existing: str, wanted: str, *, registry: "authors_mod.AuthorRegistry | None"
+) -> bool:
+    """True when two shelf names differ only in the order of the same people.
+
+    A difference in *spelling* does not qualify, even though both names reduce
+    to the same key: "JN Chaney" must not keep hold of books whose canonical
+    shelf is "J.N. Chaney", or the shelf could never be renamed.  So an
+    existing folder qualifies only when it already spells every author the way
+    the registry does - leaving order as the one thing it may differ by.
+    """
+
+    if authors_mod.shelf_key(existing) != authors_mod.shelf_key(wanted):
+        return False
+    if registry is None:  # pragma: no cover - the caller checks this first
+        return False
+
+    names = authors_mod.split_authors(existing)
+    if not names:
+        return False
+    return all((registry.canonical_name(name) or name) == name for name in names)
+
+
+def match_existing_case(
+    root: Path,
+    target: Path,
+    *,
+    fold_case: bool = True,
+    fold_author_case: bool = True,
+    fold_author_set: bool = True,
+    registry: "authors_mod.AuthorRegistry | None" = None,
+) -> Path:
     """Re-spell *target*'s directories to match ones already in the library.
 
     A book tagged "Funa" files into the existing ``FUNA/`` rather than beside
@@ -351,6 +428,19 @@ def match_existing_case(root: Path, target: Path) -> Path:
     worse.  Only an existing directory's spelling is reused, and only the
     directory components: the file name is left to
     :func:`forge.paths.collision_safe_path`, which compares without case.
+
+    The two folds answer different questions and are controlled separately:
+
+    *fold_case* keeps two folders differing only in case from ever existing at
+    once, which is an SMB requirement rather than a preference.
+    *fold_author_case* is the same thing for the author level alone, which the
+    backfill switches off: an author has a canonical spelling to be renamed to,
+    while a series or a book folder has nothing better to be than consistent
+    with the folder already there.
+
+    *fold_author_set* joins a collaboration filed in another *order* to the
+    folder it already has - but only when that folder already spells every
+    author canonically, so a variant spelling can still be renamed.
     """
 
     try:
@@ -360,7 +450,14 @@ def match_existing_case(root: Path, target: Path) -> Path:
 
     resolved = root
     for index, part in enumerate(parts[:-1]):
-        match = existing_case(resolved, part, author_set=index == 0)
+        at_author_level = index == 0
+        match = existing_case(
+            resolved,
+            part,
+            fold_case=fold_author_case if at_author_level else fold_case,
+            author_set=fold_author_set and at_author_level,
+            registry=registry,
+        )
         resolved = resolved / (match or part)
     return resolved / parts[-1]
 
@@ -504,6 +601,7 @@ def plan_book(
             library_path(
                 cfg.library_dir, meta, suffix=path.suffix.casefold(), registry=registry
             ),
+            registry=registry,
         ),
         reserved=reserved,
     )

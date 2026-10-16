@@ -129,6 +129,205 @@ class SchemaUpgrade(TempCaseMixin, unittest.TestCase):
             self.assertEqual(registry.identity("JN Chaney"), "B00W2ZAK7E")
 
 
+class PinnedNames(TempCaseMixin, unittest.TestCase):
+    """A spelling chosen by hand outranks any automatic vote."""
+
+    CHANEY = "B00W2ZAK7E"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.registry = AuthorRegistry(self.root / "authors.sqlite3")
+        self.addCleanup(self.registry.close)
+        self.registry.learn([Contributor(self.CHANEY, "JN Chaney")])
+
+    def test_an_automatic_choice_can_change_a_name(self) -> None:
+        self.assertTrue(self.registry.set_canonical(self.CHANEY, "J. N. Chaney"))
+        self.assertEqual(self.registry.canonical_of(self.CHANEY), "J. N. Chaney")
+
+    def test_renaming_by_hand_pins_the_name(self) -> None:
+        self.registry.rename(self.CHANEY, "J. N. Chaney")
+        self.assertTrue(self.registry.is_pinned(self.CHANEY))
+
+    def test_an_automatic_choice_will_not_overrule_a_pin(self) -> None:
+        self.registry.rename(self.CHANEY, "J. N. Chaney")
+        self.assertFalse(self.registry.set_canonical(self.CHANEY, "JN Chaney"))
+        self.assertEqual(self.registry.canonical_of(self.CHANEY), "J. N. Chaney")
+
+    def test_unpinning_lets_the_vote_decide_again(self) -> None:
+        self.registry.rename(self.CHANEY, "J. N. Chaney")
+        self.registry.unpin(self.CHANEY)
+        self.assertTrue(self.registry.set_canonical(self.CHANEY, "JN Chaney"))
+
+    def test_a_learned_name_is_not_pinned(self) -> None:
+        self.assertFalse(self.registry.is_pinned(self.CHANEY))
+
+    def test_a_v3_registry_gains_the_column(self) -> None:
+        import sqlite3
+
+        path = self.root / "v3.sqlite3"
+        connection = sqlite3.connect(str(path), isolation_level=None)
+        connection.executescript(
+            """
+            CREATE TABLE schema_info (version INTEGER NOT NULL);
+            CREATE TABLE author (
+                author_id      TEXT PRIMARY KEY,
+                canonical_name TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+            CREATE TABLE author_asin (
+                asin TEXT PRIMARY KEY, author_id TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE author_alias (
+                name_key TEXT PRIMARY KEY, author_id TEXT NOT NULL,
+                spelling TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE author_unknown (
+                name_key TEXT PRIMARY KEY, spelling TEXT NOT NULL,
+                seen INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
+            );
+            INSERT INTO schema_info VALUES (3);
+            INSERT INTO author VALUES ('B00W2ZAK7E', 'J.N. Chaney', '2026-10-16T00:00:00+00:00');
+            INSERT INTO author_alias VALUES
+                ('jnchaney', 'B00W2ZAK7E', 'J.N. Chaney', 'audible', '2026-10-16T00:00:00+00:00');
+            """
+        )
+        connection.close()
+
+        with AuthorRegistry(path) as registry:
+            self.assertFalse(registry.is_pinned("B00W2ZAK7E"))
+            self.assertEqual(registry.canonical_name("JN Chaney"), "J.N. Chaney")
+
+
+class SavingSeveralNames(TempCaseMixin, unittest.TestCase):
+    """What the review interface needs: all or nothing, and never blank."""
+
+    CHANEY = "B00W2ZAK7E"
+    MAGGERT = "B00EKN8RHG"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.registry = AuthorRegistry(self.root / "authors.sqlite3")
+        self.addCleanup(self.registry.close)
+        self.registry.learn(
+            [Contributor(self.CHANEY, "JN Chaney"), Contributor(self.MAGGERT, "Terry Maggert")]
+        )
+
+    def test_several_names_are_written_together(self) -> None:
+        count = self.registry.rename_many(
+            {self.CHANEY: "J.N. Chaney", self.MAGGERT: "T. Maggert"}
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(self.registry.canonical_of(self.CHANEY), "J.N. Chaney")
+        self.assertEqual(self.registry.canonical_of(self.MAGGERT), "T. Maggert")
+
+    def test_saving_a_name_pins_it(self) -> None:
+        self.registry.rename_many({self.CHANEY: "J.N. Chaney"})
+        self.assertTrue(self.registry.is_pinned(self.CHANEY))
+
+    def test_a_blank_name_writes_nothing_at_all(self) -> None:
+        # All or nothing: the good row must not land either, or a failed save
+        # would leave half the screen applied.
+        with self.assertRaises(ValueError):
+            self.registry.rename_many({self.CHANEY: "J.N. Chaney", self.MAGGERT: "  "})
+        self.assertEqual(self.registry.canonical_of(self.CHANEY), "JN Chaney")
+
+    def test_an_unknown_identity_writes_nothing_at_all(self) -> None:
+        with self.assertRaises(ValueError):
+            self.registry.rename_many(
+                {self.CHANEY: "J.N. Chaney", "B000000000": "Nobody"}
+            )
+        self.assertEqual(self.registry.canonical_of(self.CHANEY), "JN Chaney")
+
+    def test_names_are_stripped(self) -> None:
+        self.registry.rename_many({self.CHANEY: "  J.N. Chaney  "})
+        self.assertEqual(self.registry.canonical_of(self.CHANEY), "J.N. Chaney")
+
+    def test_saving_nothing_is_allowed(self) -> None:
+        self.assertEqual(self.registry.rename_many({}), 0)
+
+    def test_book_counts_are_stored_and_reported(self) -> None:
+        self.registry.set_book_counts({self.CHANEY: 55, self.MAGGERT: 9})
+        rows = {row.identity: row for row in self.registry.review_rows()}
+        self.assertEqual(rows[self.CHANEY].books, 55)
+        self.assertEqual(rows[self.MAGGERT].books, 9)
+
+    def test_a_review_row_carries_what_the_interface_shows(self) -> None:
+        self.registry.learn([Contributor(self.CHANEY, "Chaney, J.N.")])
+        self.registry.rename(self.MAGGERT, "Terry Maggert")
+        rows = {row.identity: row for row in self.registry.review_rows()}
+
+        chaney = rows[self.CHANEY]
+        self.assertEqual(sorted(chaney.spellings), ["Chaney, J.N.", "JN Chaney"])
+        self.assertEqual(chaney.asins, 1)
+        self.assertTrue(chaney.respelled)
+        self.assertTrue(chaney.has_asin)
+        self.assertFalse(chaney.pinned)
+        self.assertTrue(rows[self.MAGGERT].pinned)
+
+    def test_an_author_with_no_asin_reports_as_much(self) -> None:
+        self.registry.learn([Contributor(None, "Rhaegar")])
+        row = [r for r in self.registry.review_rows() if r.canonical == "Rhaegar"][0]
+        self.assertFalse(row.has_asin)
+        self.assertEqual(row.asins, 0)
+
+    def test_a_name_holding_a_comma_survives_the_round_trip(self) -> None:
+        # Spellings are joined for one query, so the separator must not be a
+        # comma: "Chaney, J.N." contains one.
+        self.registry.learn([Contributor(self.CHANEY, "Chaney, J.N.")])
+        row = [r for r in self.registry.review_rows() if r.identity == self.CHANEY][0]
+        self.assertIn("Chaney, J.N.", row.spellings)
+
+    def test_a_v4_registry_gains_the_count_column(self) -> None:
+        import sqlite3
+
+        path = self.root / "v4.sqlite3"
+        connection = sqlite3.connect(str(path), isolation_level=None)
+        connection.executescript(
+            """
+            CREATE TABLE schema_info (version INTEGER NOT NULL);
+            CREATE TABLE author (
+                author_id TEXT PRIMARY KEY, canonical_name TEXT NOT NULL,
+                canonical_pinned INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE author_asin (
+                asin TEXT PRIMARY KEY, author_id TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE author_alias (
+                name_key TEXT PRIMARY KEY, author_id TEXT NOT NULL,
+                spelling TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE author_unknown (
+                name_key TEXT PRIMARY KEY, spelling TEXT NOT NULL,
+                seen INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
+            );
+            INSERT INTO schema_info VALUES (4);
+            INSERT INTO author VALUES
+                ('B00W2ZAK7E', 'J.N. Chaney', 1, '2026-10-16T00:00:00+00:00');
+            INSERT INTO author_alias VALUES
+                ('jnchaney', 'B00W2ZAK7E', 'J.N. Chaney', 'audible',
+                 '2026-10-16T00:00:00+00:00');
+            """
+        )
+        connection.close()
+
+        with AuthorRegistry(path) as registry:
+            row = registry.review_rows()[0]
+            self.assertEqual(row.books, 0)
+            self.assertTrue(row.pinned)
+            registry.set_book_counts({"B00W2ZAK7E": 7})
+            self.assertEqual(registry.review_rows()[0].books, 7)
+
+    def test_a_failed_transaction_leaves_nothing_behind(self) -> None:
+        with self.assertRaises(RuntimeError):
+            with self.registry.transaction() as connection:
+                connection.execute(
+                    "UPDATE author SET canonical_name = 'Wrong' WHERE author_id = ?",
+                    (self.CHANEY,),
+                )
+                raise RuntimeError("something went wrong halfway")
+        self.assertEqual(self.registry.canonical_of(self.CHANEY), "JN Chaney")
+
+
 class FoldingDuplicateIdentities(TempCaseMixin, unittest.TestCase):
     """A v2 registry had one identity per ASIN; one author can have several."""
 

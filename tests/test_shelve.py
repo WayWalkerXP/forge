@@ -353,10 +353,17 @@ class CaseInsensitiveFolders(unittest.TestCase):
             self.root / "An Author" / "Earth's First StarFighter" / "Book.m4b",
         )
 
-    def test_an_exact_match_wins_over_a_case_variant(self) -> None:
-        (self.root / "FUNA").mkdir()
+    def test_two_case_variants_are_consolidated_not_kept_apart(self) -> None:
+        # Deliberately *not* "the exact name wins": when both spellings exist
+        # the books have to end up in one of them, or Windows can reach only
+        # one and the other's contents are invisible.  The fuller shelf wins,
+        # so the fewest books move.
+        (self.root / "FUNA" / "Book One").mkdir(parents=True)
+        (self.root / "FUNA" / "Book One" / "One.m4b").touch()
         (self.root / "Funa").mkdir()
-        self.assertEqual(self.resolve("Funa", "Book.m4b"), self.root / "Funa" / "Book.m4b")
+
+        self.assertEqual(self.resolve("Funa", "Two.m4b"), self.root / "FUNA" / "Two.m4b")
+        self.assertEqual(self.resolve("FUNA", "Two.m4b"), self.root / "FUNA" / "Two.m4b")
 
     def test_two_existing_variants_resolve_the_same_way_every_time(self) -> None:
         (self.root / "XKarnation").mkdir()

@@ -259,9 +259,45 @@ When the registry knows the author but the tag spells them differently, the
 panel says `⇒ shelves as J. N. Chaney` instead, since nothing needs checking —
 that rewrite is the mechanism working.
 
+`forge authors` opens a review interface over the registry — the frequency vote
+is the best rule a machine has and it is wrong often enough to want checking.
+It lists every identity with the spellings Amazon has used, how many books the
+author has, and how many contributor ids they hold.
+
+| key | action |
+|---|---|
+| `e` / `enter` | change the spelling; the author's other spellings are offered as numbered choices |
+| `p` | pin or unpin the name |
+| `u` | drop this row's unsaved change |
+| `/` | search name, spelling or identity |
+| `f` | cycle filters (all / recorded more than one way / pinned / unpinned / no Audible id / unsaved / unidentified) |
+| `o` | sort (books, name, spellings, ids, pinned, recently changed) |
+| `s` | save |
+| `q` | quit |
+
+**Nothing is written until you save.** Edits live in memory, the status bar
+shows `[3 unsaved]`, `s` asks for confirmation, and quitting with unsaved work
+offers save / discard / stay. Saving **pins** each name, so the next backfill's
+frequency vote cannot overrule a choice you made on purpose.
+
+Deliberately limited: no identity can be deleted, no key edited, and a blank
+name is refused three times over — in the dialog, when the save is built, and by
+the registry itself. The interface opens the registry and nothing else: no tags,
+no files, no change log. Reviewing a name is not an instruction to go and
+rewrite a library; `forge backfill` does that, when you ask it to.
+
+The 198 spellings with no identity at all appear in their own read-only filter,
+so junk in an author tag (`Full Cast`, `40k Books`) is visible. Linking one to
+an identity stays a CLI job, since that is the one operation where a wrong
+answer merges two real people.
+
+Non-interactive callers are unaffected: a pipe, a cron job, or `--report` gets
+the text summary.
+
 | command | what it does |
 |---|---|
-| `forge authors` | what the registry knows, and which authors Amazon spells more than one way |
+| `forge authors` | the review interface (or the text report when not a terminal) |
+| `forge authors --report` | the text report: what the registry knows, and which authors Amazon records more than one way |
 | `forge authors "JN Chaney"` | the identity behind one spelling, its other spellings, and its Audible ids |
 | `forge authors --unknown` | spellings it could not place |
 | `forge authors --link "Brandon Morris" B01N7UFRX4` | declare a spelling to be a known author (an ASIN, or a `name:` identity) |

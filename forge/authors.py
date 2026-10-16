@@ -37,14 +37,15 @@ import logging
 import re
 import sqlite3
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -58,6 +59,15 @@ CREATE TABLE IF NOT EXISTS schema_info (
 CREATE TABLE IF NOT EXISTS author (
     author_id      TEXT PRIMARY KEY,
     canonical_name TEXT NOT NULL,
+    -- 1 when a person chose this spelling, which no automatic pass may
+    -- overrule.  The backfill picks canonical names by frequency across the
+    -- library; a name set with `forge authors --rename` outranks the vote.
+    canonical_pinned INTEGER NOT NULL DEFAULT 0,
+    -- How many books in the library were by this author when the backfill last
+    -- counted.  Stored because the backfill counts them anyway to run the
+    -- frequency vote, and the review interface wants to show the authors who
+    -- matter most first.  Nothing depends on it being current.
+    book_count     INTEGER NOT NULL DEFAULT 0,
     updated_at     TEXT NOT NULL
 );
 
@@ -177,6 +187,29 @@ class Contributor:
 
 
 @dataclass(frozen=True)
+class ReviewRow:
+    """One identity, with everything the review interface shows about it."""
+
+    identity: str
+    canonical: str
+    pinned: bool
+    spellings: tuple[str, ...]
+    asins: int
+    books: int
+    updated_at: str
+
+    @property
+    def respelled(self) -> bool:
+        """True when Amazon has recorded this author more than one way."""
+
+        return len(self.spellings) > 1 or self.asins > 1
+
+    @property
+    def has_asin(self) -> bool:
+        return not self.identity.startswith("name:")
+
+
+@dataclass(frozen=True)
 class Resolution:
     """What the registry made of one author tag."""
 
@@ -235,14 +268,24 @@ class AuthorRegistry:
         new tables created *inside* its transaction.
         """
 
-        for statement in _SCHEMA.split(";"):
-            if statement.strip():
-                self._connection.execute(statement)
+        # sqlite3.complete_statement rather than a split on ";": a semicolon
+        # inside one of the comments above would otherwise cut a CREATE TABLE
+        # in half, which it did.
+        buffered = ""
+        for line in _SCHEMA.splitlines(keepends=True):
+            buffered += line
+            if sqlite3.complete_statement(buffered):
+                self._connection.execute(buffered)
+                buffered = ""
+        if buffered.strip():
+            self._connection.execute(buffered)
 
     def _migrate(self) -> None:
         self._upgrade_from_v1()
         self._upgrade_from_v2()
         self._create_tables()
+        self._upgrade_from_v3()
+        self._upgrade_from_v4()
         row = self._connection.execute("SELECT version FROM schema_info").fetchone()
         if row is None:
             self._connection.execute(
@@ -397,6 +440,52 @@ class AuthorRegistry:
         else:
             self._connection.execute("COMMIT")
 
+    def _upgrade_from_v3(self) -> None:
+        """Add canonical_pinned, which v3 had no column for."""
+
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(author)").fetchall()
+        }
+        if "canonical_pinned" in columns:
+            return
+        LOGGER.info("upgrading the author registry from schema version 3")
+        self._connection.execute(
+            "ALTER TABLE author ADD COLUMN canonical_pinned INTEGER NOT NULL DEFAULT 0"
+        )
+
+    def _upgrade_from_v4(self) -> None:
+        """Add book_count, which v4 had no column for."""
+
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(author)").fetchall()
+        }
+        if "book_count" in columns:
+            return
+        LOGGER.info("upgrading the author registry from schema version 4")
+        self._connection.execute(
+            "ALTER TABLE author ADD COLUMN book_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Run several writes as one, so a bad row writes nothing.
+
+        The connection autocommits every statement otherwise, which is right
+        for learning one author at a time and wrong for saving a screenful of
+        renames.
+        """
+
+        self._connection.execute("BEGIN")
+        try:
+            yield self._connection
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
+
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -495,12 +584,81 @@ class AuthorRegistry:
         self._connection.execute("DELETE FROM author_unknown WHERE name_key = ?", (key,))
 
     def rename(self, author_id: str, canonical_name: str) -> None:
-        """Change the spelling an identity is written as."""
+        """Change the spelling an identity is written as, and pin it.
 
+        Pinned because this is a person's decision: the backfill chooses
+        canonical names by how often the library uses each spelling, and a vote
+        must not quietly undo a choice someone made on purpose.
+        """
+
+        self._connection.execute(
+            "UPDATE author SET canonical_name = ?, canonical_pinned = 1, updated_at = ? "
+            "WHERE author_id = ?",
+            (canonical_name.strip(), self._now(), author_id),
+        )
+
+    def set_canonical(self, author_id: str, canonical_name: str) -> bool:
+        """Change the spelling, unless someone pinned it.  True when written."""
+
+        if self.is_pinned(author_id):
+            return False
         self._connection.execute(
             "UPDATE author SET canonical_name = ?, updated_at = ? WHERE author_id = ?",
             (canonical_name.strip(), self._now(), author_id),
         )
+        return True
+
+    def unpin(self, author_id: str) -> None:
+        """Let an automatic pass choose this author's spelling again."""
+
+        self._connection.execute(
+            "UPDATE author SET canonical_pinned = 0, updated_at = ? WHERE author_id = ?",
+            (self._now(), author_id),
+        )
+
+    def rename_many(self, names: Mapping[str, str]) -> int:
+        """Apply several renames as one, pinning each.  Returns the count.
+
+        Checked before anything is written, and written in one transaction, so
+        a single bad row leaves the registry exactly as it was.  A blank name
+        is refused here as well as by the interface that collected it: the
+        canonical name ends up in a tag and a folder name, and an empty one
+        would leave books with no shelf to go to.
+        """
+
+        cleaned: dict[str, str] = {}
+        for identity, name in names.items():
+            if not name or not name.strip():
+                raise ValueError(f"{identity} was given a blank name")
+            if self.canonical_of(identity) is None:
+                raise ValueError(f"{identity} is not a known author")
+            cleaned[identity] = name.strip()
+
+        if not cleaned:
+            return 0
+
+        now = self._now()
+        with self.transaction() as connection:
+            for identity, name in cleaned.items():
+                connection.execute(
+                    "UPDATE author SET canonical_name = ?, canonical_pinned = 1, "
+                    "updated_at = ? WHERE author_id = ?",
+                    (name, now, identity),
+                )
+        return len(cleaned)
+
+    def set_book_counts(self, counts: Mapping[str, int]) -> None:
+        """Record how many books each author has, as last counted."""
+
+        if not counts:
+            return
+        now = self._now()
+        with self.transaction() as connection:
+            for identity, count in counts.items():
+                connection.execute(
+                    "UPDATE author SET book_count = ?, updated_at = ? WHERE author_id = ?",
+                    (int(count), now, identity),
+                )
 
     def note_unknown(self, names: Iterable[str]) -> None:
         """Remember a spelling with no identity, for the candidate list."""
@@ -529,6 +687,22 @@ class AuthorRegistry:
             "SELECT author_id FROM author_alias WHERE name_key = ?", (name_key(name),)
         ).fetchone()
         return row["author_id"] if row else None
+
+    def canonical_of(self, author_id: str) -> str | None:
+        """The spelling an identity is written as, by id rather than by name."""
+
+        row = self._connection.execute(
+            "SELECT canonical_name FROM author WHERE author_id = ?", (author_id,)
+        ).fetchone()
+        return row["canonical_name"] if row else None
+
+    def is_pinned(self, author_id: str) -> bool:
+        """True when a person chose this author's spelling by hand."""
+
+        row = self._connection.execute(
+            "SELECT canonical_pinned FROM author WHERE author_id = ?", (author_id,)
+        ).fetchone()
+        return bool(row["canonical_pinned"]) if row else False
 
     def identity_for_asin(self, asin: str) -> str | None:
         """The identity an Audible contributor ASIN belongs to."""
@@ -587,6 +761,47 @@ class AuthorRegistry:
             resolved=tuple(resolved),
             unknown=tuple(unknown),
         )
+
+    #: Spellings are joined with the unit separator, not a comma: an author
+    #: name may contain commas and often does.
+    _JOIN = "\x1f"
+
+    def review_rows(self) -> list[ReviewRow]:
+        """Every identity, in one query.
+
+        One query rather than :meth:`identities` plus a :meth:`aliases_of` per
+        row, which for this library would be some six thousand of them.
+        """
+
+        rows = self._connection.execute(
+            "SELECT author.author_id AS identity, "
+            "       author.canonical_name AS canonical, "
+            "       author.canonical_pinned AS pinned, "
+            "       author.book_count AS books, "
+            "       author.updated_at AS updated_at, "
+            "       (SELECT GROUP_CONCAT(spelling, char(31)) FROM author_alias "
+            "          WHERE author_alias.author_id = author.author_id) AS spellings, "
+            "       (SELECT COUNT(*) FROM author_asin "
+            "          WHERE author_asin.author_id = author.author_id) AS asins "
+            "FROM author ORDER BY author.canonical_name"
+        ).fetchall()
+
+        return [
+            ReviewRow(
+                identity=row["identity"],
+                canonical=row["canonical"],
+                pinned=bool(row["pinned"]),
+                spellings=tuple(
+                    (row["spellings"] or "").split(self._JOIN)
+                    if row["spellings"]
+                    else ()
+                ),
+                asins=int(row["asins"] or 0),
+                books=int(row["books"] or 0),
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
 
     def unknown_names(self) -> list[tuple[str, int]]:
         """Spellings with no identity, most often seen first."""

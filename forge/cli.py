@@ -230,6 +230,39 @@ def build_parser() -> argparse.ArgumentParser:
     hist.add_argument("--stats", action="store_true", help="database statistics")
     hist.add_argument("--prune", type=int, metavar="DAYS", help="delete records older than DAYS")
 
+    backfill_cmd = sub.add_parser(
+        "backfill",
+        help="reconcile an existing library with the author registry",
+        description="Books shelved before the registry existed carry whatever "
+        "spelling Amazon returned, so one author can hold several shelves. This "
+        "pass identifies every author, picks each one's canonical spelling by how "
+        "often the library uses it, and moves the books. Reports by default and "
+        "writes nothing without --apply. Rerunning is the resume: a book already "
+        "correct produces no action.",
+        parents=[shared],
+    )
+    backfill_cmd.add_argument(
+        "--apply", action="store_true", help="carry the plan out; without this, nothing is written"
+    )
+    backfill_cmd.add_argument(
+        "--identify-only",
+        action="store_true",
+        help="fill the registry and choose canonical names, then stop",
+    )
+    backfill_cmd.add_argument(
+        "--no-identify",
+        action="store_true",
+        help="plan from the registry as it stands, asking Audible nothing",
+    )
+    backfill_cmd.add_argument(
+        "--library", type=Path, help="override library_dir"
+    )
+    backfill_cmd.add_argument("--limit", type=int, help="stop after this many books")
+    backfill_cmd.add_argument("--csv", type=Path, metavar="FILE", help="write the plan to a CSV file")
+    backfill_cmd.add_argument(
+        "--show", type=int, default=20, help="how many planned changes to print"
+    )
+
     authors_cmd = sub.add_parser(
         "authors",
         help="inspect and correct the author identity registry",
@@ -266,6 +299,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     authors_cmd.add_argument(
         "--unknown", action="store_true", help="list only the spellings it could not place"
+    )
+    authors_cmd.add_argument(
+        "--report",
+        action="store_true",
+        help="print the text report instead of opening the review interface",
     )
     authors_cmd.add_argument(
         "--limit", type=int, default=25, help="how many rows to show"
@@ -1153,6 +1191,150 @@ def _record_history(args: argparse.Namespace, path: Path, changes: dict, *, sour
         LOGGER.debug("could not record history for %s", path, exc_info=True)
 
 
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """Reconcile an existing library with the author registry."""
+
+    import csv as csv_mod
+
+    from . import authors as authors_mod
+    from . import backfill as backfill_mod
+    from . import render
+    from .control import RunController
+    from .errors import ConfigError
+    from .lock import Lock
+
+    cfg = _load_config(args)
+    renderer = render.make_renderer(force_plain=args.plain, no_color=args.no_color)
+
+    library = args.library or cfg.library_dir
+    if library is None:
+        raise ConfigError(
+            "no library directory: set [paths] library_dir in the config, or pass --library"
+        )
+    library = Path(library).expanduser().resolve()
+    if not library.is_dir():
+        raise ConfigError(f"the library directory does not exist: {library}")
+    from . import config as config_mod
+
+    cfg = config_mod.with_overrides(cfg, library_dir=library)
+
+    started = time.monotonic()
+
+    with Lock(cfg.lock_path), authors_mod.AuthorRegistry(cfg.authors_db_path) as registry:
+        renderer.info(f"reading {library}…")
+        surveyed, unreadable = backfill_mod.survey(library, progress=_every(renderer, 500))
+        renderer.info(f"{len(surveyed)} book(s) read")
+        for path, why in unreadable[:10]:
+            renderer.warn(f"skipping {path.name}: {why}")
+        if len(unreadable) > 10:
+            renderer.warn(f"...and {len(unreadable) - 10} more that could not be read")
+        if not surveyed:
+            return EXIT_OK
+
+        if not args.no_identify:
+            with _audible_for_identities(renderer, args) as audible:
+                report = backfill_mod.identify(
+                    surveyed, registry, audible, progress=_every(renderer, 25)
+                )
+            renderer.info(f"identities: {report.describe()}")
+
+            renamed = backfill_mod.choose_canonical_names(surveyed, registry)
+            renderer.info(f"canonical spellings chosen: {len(renamed)} changed")
+            for identity, was, now in renamed[: args.show]:
+                renderer.info(f"  {was!r} → {now!r}  [dim]{identity}[/dim]")
+
+        unplaced = registry.unknown_names()
+        if unplaced:
+            renderer.warn(
+                f"{len(unplaced)} author spelling(s) could not be identified; "
+                f"they keep the spelling they have (`forge authors --unknown` lists them)"
+            )
+
+        if args.identify_only:
+            renderer.info(f"stopped after identifying, in {_elapsed(started)}")
+            return EXIT_OK
+
+        actions = backfill_mod.plan(surveyed, cfg, registry, progress=_every(renderer, 500))
+        wanted = [action for action in actions if action.wanted]
+        if args.limit:
+            wanted = wanted[: args.limit]
+
+        counts = backfill_mod.summarise(actions)
+        before, after = backfill_mod.shelves_before_and_after(actions, library)
+        renderer.info(
+            f"{counts['books']} book(s): {counts['correct']} already correct, "
+            f"{counts['retag']} need a tag fix, {counts['move']} need moving"
+        )
+        renderer.info(f"author shelves: {before} now → {after} after")
+
+        if args.csv:
+            _write_backfill_csv(args.csv, actions, library, csv_mod)
+            renderer.info(f"plan written to {args.csv}")
+
+        for action in wanted[: args.show]:
+            renderer.info(f"  {action.source.name[:60]}")
+            renderer.info(f"      {action.describe()}")
+        if len(wanted) > args.show:
+            renderer.info(f"  ...and {len(wanted) - args.show} more")
+
+        if not args.apply:
+            renderer.info(
+                f"nothing written — rerun with --apply to carry this out "
+                f"({_elapsed(started)})"
+            )
+            return EXIT_OK
+
+        done = failed = 0
+        with RunController() as controller:
+            for index, action in enumerate(wanted, 1):
+                try:
+                    note = backfill_mod.apply(action, cfg)
+                except Exception as exc:
+                    LOGGER.exception("backfill failed for %s", action.source)
+                    renderer.warn(f"[{index}/{len(wanted)}] {action.source.name}: {exc}")
+                    failed += 1
+                else:
+                    done += 1
+                    renderer.info(f"[{index}/{len(wanted)}] {action.source.name}: {note}")
+                if controller.should_stop(prompt=renderer.info):
+                    renderer.warn(
+                        f"stopped by request with {len(wanted) - index} book(s) left; "
+                        f"rerun to continue"
+                    )
+                    break
+
+        renderer.info(f"backfill finished in {_elapsed(started)}: {done} done, {failed} failed")
+        return EXIT_FAILURES if failed else EXIT_OK
+
+
+def _every(renderer, step: int):
+    """A progress callback that reports every *step* items."""
+
+    def report(index: int, total: int, path: Path) -> None:
+        if index % step == 0 or index == total:
+            renderer.info(f"  {index}/{total}  {path.name[:60]}")
+
+    return report
+
+
+def _elapsed(started: float) -> str:
+    seconds = int(time.monotonic() - started)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _write_backfill_csv(path: Path, actions, library: Path, csv_mod) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv_mod.writer(handle)
+        writer.writerow(["source", "target", "tag_fixes", "reasons"])
+        for action in actions:
+            writer.writerow([
+                str(action.source.relative_to(library)),
+                str(action.target.relative_to(library)),
+                "; ".join(f"{k}={v!r}" for k, v in sorted(action.tag_fixes.items())),
+                action.describe(),
+            ])
+
+
 def cmd_authors(args: argparse.Namespace) -> int:
     """Inspect and correct the author identity registry."""
 
@@ -1160,6 +1342,19 @@ def cmd_authors(args: argparse.Namespace) -> int:
     from . import render
 
     cfg = _load_config(args)
+
+    # With nothing else asked for, this is a review session rather than a
+    # report: the interface is the only practical way to work through three
+    # thousand authors.  A pipe or a cron job still gets the report, and
+    # --report forces it.
+    interactive = sys.stdout.isatty() and not any(
+        (args.name, args.link, args.rename, args.unknown, args.report, args.plain)
+    )
+    if interactive:
+        from .tui.authors_app import run_author_review
+
+        return run_author_review(cfg)
+
     renderer = render.make_renderer(force_plain=args.plain, no_color=args.no_color)
 
     with authors_mod.AuthorRegistry(cfg.authors_db_path) as registry:
@@ -1250,6 +1445,7 @@ _HANDLERS = {
     "history": cmd_history,
     "undo": cmd_undo,
     "authors": cmd_authors,
+    "backfill": cmd_backfill,
 }
 
 

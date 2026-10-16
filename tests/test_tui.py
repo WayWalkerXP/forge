@@ -950,6 +950,11 @@ class ScreenConstruction(unittest.TestCase):
 
     def test_every_screen_constructs(self) -> None:
         from forge.tags import BookMetadata
+        from forge.tui.author_screens import (
+            AuthorSortScreen,
+            EditNameScreen,
+            UnsavedChangesScreen,
+        )
         from forge.tui.screens import (
             AudibleScreen,
             CompareScreen,
@@ -972,6 +977,11 @@ class ScreenConstruction(unittest.TestCase):
             ("ConfirmScreen", lambda: ConfirmScreen("Sure?", "detail")),
             ("SortScreen", lambda: SortScreen()),
             ("SortScreen(current)", lambda: SortScreen("author", True)),
+            ("EditNameScreen", lambda: EditNameScreen("B0", "A Name")),
+            ("EditNameScreen(choices)",
+             lambda: EditNameScreen("B0", "A Name", ["A Name", "Another"])),
+            ("UnsavedChangesScreen", lambda: UnsavedChangesScreen(3)),
+            ("AuthorSortScreen", lambda: AuthorSortScreen([("books", "most first")])),
         ):
             with self.subTest(screen=label):
                 build()  # must not raise
@@ -980,14 +990,19 @@ class ScreenConstruction(unittest.TestCase):
         import inspect
 
         from textual.screen import ModalScreen
+        from forge.tui import author_screens as author_screens_mod
         from forge.tui import screens as screens_mod
 
         offenders: list[str] = []
-        for name, cls in vars(screens_mod).items():
-            if not inspect.isclass(cls) or not issubclass(cls, ModalScreen):
-                continue
-            if cls.__module__ != screens_mod.__name__:
-                continue
+        candidates = [
+            (name, cls)
+            for module in (screens_mod, author_screens_mod)
+            for name, cls in vars(module).items()
+            if inspect.isclass(cls)
+            and issubclass(cls, ModalScreen)
+            and cls.__module__ == module.__name__
+        ]
+        for name, cls in candidates:
 
             source = inspect.getsource(cls.__init__) if cls.__init__ is not object.__init__ else ""
             assigned = {
@@ -1693,6 +1708,11 @@ class ScreenLayout(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
 
     async def test_the_other_dialogs_fit_too(self) -> None:
         from forge.tags import BookMetadata
+        from forge.tui.author_screens import (
+            AuthorSortScreen,
+            EditNameScreen,
+            UnsavedChangesScreen,
+        )
         from forge.tui.screens import (
             CompareScreen,
             ConfirmScreen,
@@ -1718,6 +1738,13 @@ class ScreenLayout(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
                 ("DispositionScreen(batch)",
                  lambda: DispositionScreen(self.batch_book(), [self.batch_book()] * 40),
                  ["#title", "#suggestion", "#hint"]),
+                ("EditNameScreen",
+                 lambda: EditNameScreen("B0", "A Name", [f"Spelling {i}" for i in range(9)]),
+                 ["#choices", "#row", "#buttons", "#hint"]),
+                ("UnsavedChangesScreen", lambda: UnsavedChangesScreen(3), ["#title", "#hint"]),
+                ("AuthorSortScreen",
+                 lambda: AuthorSortScreen([(f"order{i}", "why") for i in range(6)]),
+                 ["#direction", "#choice-0", "#hint"]),
             ):
                 app.push_screen(build())
                 await pilot.pause(0.2)
