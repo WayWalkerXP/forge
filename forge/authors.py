@@ -45,7 +45,7 @@ from typing import Iterable, Iterator, Mapping, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -175,6 +175,65 @@ def split_authors(value: str | None) -> list[str]:
             continue
         names.append(part)
     return names
+
+
+def plausibly_same_person(first: str, second: str) -> bool:
+    """True when two names look like one person written two ways.
+
+    Needed because an Audible contributor ASIN does not reliably identify a
+    person.  Every Great Courses lecturer is given the imprint's own
+    contributor id - one payload returns ``B06XPWVHFB`` twice, once as
+    "Constance Kassor" and once as "The Great Courses" - and Steve Cavanagh
+    shares Mark Dawson's.  Trusting the id there renamed a lecturer to her
+    publisher and erased her from her own author tag.
+
+    What a genuine second spelling looks like is a *letter or two inserted*: a
+    middle initial, an expanded first name, an honorific, a typo.  So one key
+    must be a subsequence of the other, and long enough to make that mean
+    something:
+
+        brianaldiss      ⊂ brianwaldiss        same man
+        bradbuckmaster   ⊂ bradleybuckmaster   same man
+        jonathangmeyer   ⊂ mrjonathangmeyer    same man
+        constancekassor  ⊄ thegreatcourses     not the same at all
+        markdawson       ⊄ stevecavanagh       nor these
+
+    The length ratio stops a short name from matching by accident, since a
+    five-letter name is a subsequence of a surprising number of longer ones.
+
+    Reordering counts too, because tags carry both "David Baldacci" and
+    "Baldacci, David" and they are the same man:
+
+        {baldacci, david} == {david, baldacci}
+
+    Takes names or keys; a key is simply a name with one token.
+    """
+
+    first_key, second_key = name_key(first), name_key(second)
+    if first_key == second_key:
+        return True
+    if _tokens(first) and _tokens(first) == _tokens(second):
+        return True
+
+    shorter, longer = sorted((first_key, second_key), key=len)
+    if len(shorter) < 4 or len(shorter) < 0.6 * len(longer):
+        return False
+    remaining = iter(longer)
+    return all(character in remaining for character in shorter)
+
+
+def _tokens(name: str) -> list[str]:
+    """The keyed words of a name, sorted, for comparing two orderings.
+
+    One token is no evidence of anything - every key is a single token - so a
+    single-token name returns nothing and leaves the decision to the
+    subsequence test.
+    """
+
+    # Not split on full stops: "J.N." is one token and must key as "jn", or
+    # "Chaney, J.N." would tokenise as three words and never match "JN Chaney".
+    parts = sorted(filter(None, (name_key(part) for part in re.split(r"[\s,;]+", name))))
+    return parts if len(parts) > 1 else []
 
 
 def _is_name_suffix(part: str) -> bool:
@@ -338,11 +397,14 @@ class AuthorRegistry:
             self._connection.execute(buffered)
 
     def _migrate(self) -> None:
+        stored = self._stored_version()
         self._upgrade_from_v1()
         self._upgrade_from_v2()
         self._create_tables()
         self._upgrade_from_v3()
         self._upgrade_from_v4()
+        if stored is not None and stored < 6:
+            self._split_misattributed_aliases()
         row = self._connection.execute("SELECT version FROM schema_info").fetchone()
         if row is None:
             self._connection.execute(
@@ -511,6 +573,65 @@ class AuthorRegistry:
             "ALTER TABLE author ADD COLUMN canonical_pinned INTEGER NOT NULL DEFAULT 0"
         )
 
+    def _stored_version(self) -> int | None:
+        """The version on disk, or None for a database being created now."""
+
+        try:
+            row = self._connection.execute("SELECT version FROM schema_info").fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return int(row["version"]) if row else None
+
+    def _split_misattributed_aliases(self) -> int:
+        """Undo merges made on a shared contributor id between two people.
+
+        Until schema 6 a contributor ASIN was taken as proof of identity, so
+        every Great Courses lecturer was folded into "The Great Courses" and
+        Steve Cavanagh into Mark Dawson.  Each such name gets its own
+        name-keyed identity back, keeping the spelling it arrived with.  The
+        ASIN stays with the identity that already holds it, because one ASIN
+        cannot belong to two - which is the whole problem, honestly recorded.
+        """
+
+        groups: dict[str, list[sqlite3.Row]] = {}
+        for row in self._connection.execute(
+            "SELECT alias.name_key AS name_key, alias.spelling AS spelling, "
+            "       alias.author_id AS author_id, author.canonical_name AS canonical "
+            "FROM author_alias AS alias JOIN author USING (author_id)"
+        ).fetchall():
+            groups.setdefault(row["author_id"], []).append(row)
+
+        split = 0
+        with self.transaction() as connection:
+            for identity, rows in groups.items():
+                if len(rows) < 2:
+                    continue
+                owner = rows[0]["canonical"]
+                owner_key = name_key(owner)
+                for row in rows:
+                    if row["name_key"] == owner_key:
+                        continue
+                    if plausibly_same_person(row["spelling"], owner):
+                        continue
+                    new_identity = f"name:{row['name_key']}"
+                    LOGGER.info(
+                        "splitting %r out of %r: one contributor id, two people",
+                        row["spelling"],
+                        rows[0]["canonical"],
+                    )
+                    connection.execute(
+                        "INSERT INTO author (author_id, canonical_name, updated_at) "
+                        "VALUES (?, ?, ?) ON CONFLICT (author_id) DO NOTHING",
+                        (new_identity, row["spelling"], self._now()),
+                    )
+                    connection.execute(
+                        "UPDATE author_alias SET author_id = ?, updated_at = ? "
+                        "WHERE name_key = ?",
+                        (new_identity, self._now(), row["name_key"]),
+                    )
+                    split += 1
+        return split
+
     def _upgrade_from_v4(self) -> None:
         """Add book_count, which v4 had no column for."""
 
@@ -570,10 +691,27 @@ class AuthorRegistry:
             # contributor ids for one person, so a second id is another way of
             # naming someone already known, not another person.
             identity = self.identity(contributor.name)
+            disputed = False
             if identity is None and contributor.asin:
-                identity = self.identity_for_asin(contributor.asin)
+                candidate = self.identity_for_asin(contributor.asin)
+                # ...but an id is not proof: Amazon hands one contributor id to
+                # a whole imprint's worth of lecturers.  The names have to look
+                # like one person before the id is believed.
+                if candidate is not None:
+                    owner = self.canonical_of(candidate) or ""
+                    if plausibly_same_person(contributor.name, owner):
+                        identity = candidate
+                    else:
+                        disputed = True
+                        LOGGER.debug(
+                            "not merging %r into %r: one contributor id, two names",
+                            contributor.name,
+                            owner,
+                        )
             if identity is None:
-                identity = contributor.identity
+                # A disputed id cannot be the identity either: it already
+                # belongs to somebody else, so this author is keyed by name.
+                identity = f"name:{key}" if disputed else contributor.identity
                 self._connection.execute(
                     "INSERT INTO author (author_id, canonical_name, updated_at) "
                     "VALUES (?, ?, ?) ON CONFLICT (author_id) DO NOTHING",
@@ -588,7 +726,7 @@ class AuthorRegistry:
                 (key, identity, contributor.name.strip(), kind, self._now()),
             )
             learned += cursor.rowcount or 0
-            if contributor.asin:
+            if contributor.asin and not disputed:
                 self._connection.execute(
                     "INSERT INTO author_asin (asin, author_id, updated_at) "
                     "VALUES (?, ?, ?) ON CONFLICT (asin) DO NOTHING",

@@ -224,6 +224,19 @@ Three tiers, strongest first:
 3. **Neither.** Nothing happens. The name is written exactly as it arrived and
    recorded as a candidate, because the alternative is guessing.
 
+**An Audible contributor id is not proof of identity.** Amazon gives every
+Great Courses lecturer the imprint's own id — one payload returns
+`B06XPWVHFB` twice, once as `Constance Kassor` and once as `The Great
+Courses` — and Steve Cavanagh shares Mark Dawson's. So a shared id is
+believed only when the two names look like one person: one key a subsequence
+of the other with a length ratio (a middle initial, an expanded first name,
+an honorific, a typo), or the same tokens in a different order
+(`Baldacci, David` is `David Baldacci`). That keeps the thirteen genuine
+merges in this library and rejects the two wrong ones, which had been about to
+erase a lecturer's name from her own author tag. A disputed id is not used as
+an identity either: the author is keyed by name, and the id stays with
+whoever already held it.
+
 **The key deliberately does not drop initials.** `Brandon Morris` and
 `Brandon Q. Morris` reduce to different keys and are never joined
 automatically: they might be two people, and a rule clever enough to join them

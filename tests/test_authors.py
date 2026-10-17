@@ -496,6 +496,148 @@ class FoldingDuplicateIdentities(TempCaseMixin, unittest.TestCase):
             self.assertEqual(row["version"], SCHEMA_VERSION)
 
 
+class OneContributorIdTwoPeople(TempCaseMixin, unittest.TestCase):
+    """An Audible contributor id does not reliably identify a person.
+
+    Every Great Courses lecturer is given the imprint's own id - one payload
+    returns B06XPWVHFB twice, as "Constance Kassor" and as "The Great Courses"
+    - and Steve Cavanagh shares Mark Dawson's.  Believing the id renamed a
+    lecturer to her publisher and erased her from her own author tag.
+    """
+
+    COURSES = "B06XPWVHFB"
+    DAWSON = "B0034Q9BO8"
+    ALDISS = "B000APH7RY"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.registry = AuthorRegistry(self.root / "authors.sqlite3")
+        self.addCleanup(self.registry.close)
+
+    def test_a_shared_id_does_not_merge_two_different_names(self) -> None:
+        self.registry.learn([Contributor(self.COURSES, "The Great Courses")])
+        self.registry.learn([Contributor(self.COURSES, "Constance Kassor")])
+
+        self.assertEqual(self.registry.canonical_name("Constance Kassor"), "Constance Kassor")
+        self.assertEqual(self.registry.identity("Constance Kassor"), "name:constancekassor")
+        self.assertEqual(self.registry.canonical_name("The Great Courses"), "The Great Courses")
+
+    def test_both_names_survive_a_tag_that_holds_both(self) -> None:
+        # The case that mattered: her name must not disappear from the tag.
+        self.registry.learn(
+            [Contributor(self.COURSES, "Constance Kassor"),
+             Contributor(self.COURSES, "The Great Courses")]
+        )
+        outcome = self.registry.resolve("Constance Kassor, The Great Courses")
+        self.assertIsNone(outcome.canonical)  # nothing needs changing
+        self.assertEqual(outcome.unknown, ())
+
+    def test_a_middle_initial_still_merges(self) -> None:
+        # The other half of the deal: a genuine second spelling of one person.
+        self.registry.learn([Contributor(self.ALDISS, "Brian W. Aldiss")])
+        self.registry.learn([Contributor(self.ALDISS, "Brian Aldiss")])
+
+        self.assertEqual(self.registry.identity("Brian Aldiss"), self.ALDISS)
+        self.assertEqual(self.registry.canonical_name("Brian Aldiss"), "Brian W. Aldiss")
+
+    def test_the_same_person_test_matches_the_live_cases(self) -> None:
+        from forge.authors import plausibly_same_person
+
+        same = [
+            ("Brian Aldiss", "Brian W. Aldiss"),
+            ("Brad Buckmaster", "Bradley Buckmaster"),
+            ("Jonathan G. Meyer", "Mr. Jonathan G. Meyer"),
+            ("Bernd Perpies", "Bernd Perplies"),
+            ("Blaine Lee Pardoe", "Blaine L. Pardoe"),
+            ("Anthony J. Tata", "Anthony J. J. Tata"),
+            ("Stephen Lawhead", "Stephen R Lawhead"),
+        ]
+        different = [
+            ("Constance Kassor", "The Great Courses"),
+            ("Jamin Warren", "The Great Courses"),
+            ("Steve Cavanagh", "Mark Dawson"),
+            ("Mariani Scott", "Mark Dawson"),
+            # A short name is a subsequence of a surprising number of longer
+            # ones, so the length ratio has to rule this out.
+            ("Aaron", "Alexander Ronald"),
+        ]
+        for one, two in same:
+            with self.subTest(one=one, two=two):
+                self.assertTrue(plausibly_same_person(name_key(one), name_key(two)))
+        for one, two in different:
+            with self.subTest(one=one, two=two):
+                self.assertFalse(plausibly_same_person(name_key(one), name_key(two)))
+
+    def v5_database_with_a_bad_merge(self):
+        import sqlite3
+
+        path = self.root / "v5.sqlite3"
+        connection = sqlite3.connect(str(path), isolation_level=None)
+        connection.executescript(
+            """
+            CREATE TABLE schema_info (version INTEGER NOT NULL);
+            CREATE TABLE author (
+                author_id TEXT PRIMARY KEY, canonical_name TEXT NOT NULL,
+                canonical_pinned INTEGER NOT NULL DEFAULT 0,
+                book_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE author_asin (
+                asin TEXT PRIMARY KEY, author_id TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE author_alias (
+                name_key TEXT PRIMARY KEY, author_id TEXT NOT NULL,
+                spelling TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE author_unknown (
+                name_key TEXT PRIMARY KEY, spelling TEXT NOT NULL,
+                seen INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
+            );
+            INSERT INTO schema_info VALUES (5);
+            INSERT INTO author VALUES
+                ('B06XPWVHFB', 'The Great Courses', 0, 88, '2026-10-16T00:00:00+00:00'),
+                ('B000APH7RY', 'Brian W. Aldiss',   0,  6, '2026-10-16T00:00:00+00:00');
+            INSERT INTO author_asin VALUES
+                ('B06XPWVHFB', 'B06XPWVHFB', '2026-10-16T00:00:00+00:00'),
+                ('B000APH7RY', 'B000APH7RY', '2026-10-16T00:00:00+00:00');
+            INSERT INTO author_alias VALUES
+                ('thegreatcourses', 'B06XPWVHFB', 'The Great Courses', 'audible',
+                 '2026-10-16T00:00:00+00:00'),
+                ('constancekassor', 'B06XPWVHFB', 'Constance Kassor', 'audible',
+                 '2026-10-16T00:00:00+00:00'),
+                ('brianwaldiss', 'B000APH7RY', 'Brian W. Aldiss', 'audible',
+                 '2026-10-16T00:00:00+00:00'),
+                ('brianaldiss', 'B000APH7RY', 'Brian Aldiss', 'audible',
+                 '2026-10-16T00:00:00+00:00');
+            """
+        )
+        connection.close()
+        return path
+
+    def test_opening_a_v5_registry_splits_the_bad_merge(self) -> None:
+        with AuthorRegistry(self.v5_database_with_a_bad_merge()) as registry:
+            self.assertEqual(registry.identity("Constance Kassor"), "name:constancekassor")
+            self.assertEqual(
+                registry.canonical_name("Constance Kassor"), "Constance Kassor"
+            )
+
+    def test_the_repair_leaves_a_genuine_merge_alone(self) -> None:
+        with AuthorRegistry(self.v5_database_with_a_bad_merge()) as registry:
+            self.assertEqual(registry.identity("Brian Aldiss"), "B000APH7RY")
+            self.assertEqual(registry.canonical_name("Brian Aldiss"), "Brian W. Aldiss")
+
+    def test_the_id_stays_with_the_identity_that_had_it(self) -> None:
+        with AuthorRegistry(self.v5_database_with_a_bad_merge()) as registry:
+            self.assertEqual(registry.asins_of("B06XPWVHFB"), ["B06XPWVHFB"])
+            self.assertEqual(registry.asins_of("name:constancekassor"), [])
+
+    def test_the_repair_runs_once_and_is_stable(self) -> None:
+        path = self.v5_database_with_a_bad_merge()
+        with AuthorRegistry(path) as registry:
+            before = sorted(registry.identities())
+        with AuthorRegistry(path) as registry:
+            self.assertEqual(sorted(registry.identities()), before)
+
+
 class Registry(TempCaseMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
