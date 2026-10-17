@@ -11,9 +11,20 @@ Two levels, following the convention a long-running CLI tool ought to have:
 *   A second request gives up waiting, kills ffmpeg, and removes the temporary
     file it was writing.
 
-When stdin is a terminal, ``q`` and ``p`` do the same thing without the
-ceremony of a signal.  When it is not - a cron run - only signals apply, and
-the raw-key reader is never started.
+When the run is attended - stdin *and* stdout both terminals - ``q`` and ``p``
+do the same thing without the ceremony of a signal.  Otherwise only signals
+apply and the raw-key reader is never started: ``bin/forge-cron`` run by hand
+has a terminal on stdin but its output redirected to a log, so the "keyboard
+controls active" notice would go into the log where nobody reads it, and a
+stray ``q`` would silently stop the nightly pass.
+
+**The terminal mode belongs to the controller, not to the reader thread.**  The
+reader is a daemon thread, so the interpreter does not wait for it at exit: a
+restore in its own ``finally`` loses the race with process exit every time, and
+the run ends leaving the terminal in cbreak - accepting input without echoing
+it, needing a ``reset``.  :meth:`RunController.start` enters cbreak on the
+calling thread and :meth:`RunController.stop` restores it there, so the mode is
+tied to the controller's lifetime and not to when a thread happens to notice.
 """
 
 from __future__ import annotations
@@ -47,7 +58,11 @@ class RunController:
         self._previous_sigint: Any = None
         self._previous_sigterm: Any = None
         self._temp_files: set[Path] = set()
-        self._allow_keys = allow_keys and sys.stdin.isatty()
+        self._allow_keys = allow_keys and sys.stdin.isatty() and sys.stdout.isatty()
+        #: The terminal settings to put back, and the lock that makes entering
+        #: and leaving cbreak safe to call from either thread.
+        self._tty_original: Any = None
+        self._tty_lock = threading.Lock()
 
     # ------------------------------------------------------------- lifecycle #
 
@@ -57,17 +72,31 @@ class RunController:
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
 
-        if self._allow_keys:
+        if self._allow_keys and self._enter_cbreak():
             self._thread = threading.Thread(
                 target=self._watch_keys, name="forge-keys", daemon=True
             )
             self._thread.start()
             LOGGER.info("keyboard controls active: q quits after this book, p pauses")
-        else:
-            LOGGER.debug("stdin is not a terminal; keyboard controls disabled")
+        elif not self._allow_keys:
+            LOGGER.debug("not an attended run; keyboard controls disabled")
 
     def stop(self) -> None:
         self._stop.set()
+
+        # The terminal first, and on this thread: the reader is a daemon and
+        # will be killed mid-select at interpreter exit, so anything it was
+        # going to put back would never be put back.  Idempotent, because a
+        # forced termination can reach here twice.
+        self._leave_cbreak()
+        if self._thread is not None:
+            # One select timeout plus slack.  Only tidiness - the mode is
+            # already restored - so a wedged reader must not hold up the exit.
+            self._thread.join(timeout=1.0)
+            if self._thread.is_alive():
+                LOGGER.debug("the key reader did not finish; leaving it to exit")
+            self._thread = None
+
         if self._previous_sigint is not None:
             signal.signal(signal.SIGINT, self._previous_sigint)
         if self._previous_sigterm is not None:
@@ -157,26 +186,55 @@ class RunController:
     def _quiet_keys(self) -> "_QuietKeys":
         return _QuietKeys(self)
 
-    def _watch_keys(self) -> None:
+    def _enter_cbreak(self) -> bool:
+        """Put the terminal into cbreak, remembering how to put it back.
+
+        False when stdin cannot do it at all, which leaves the run on signals
+        alone rather than failing.
+        """
+
         import termios
         import tty
 
-        descriptor = sys.stdin.fileno()
-        try:
-            original = termios.tcgetattr(descriptor)
-        except termios.error:
-            LOGGER.debug("stdin does not support raw mode; keyboard controls disabled")
+        with self._tty_lock:
+            if self._tty_original is not None:
+                return True
+            descriptor = sys.stdin.fileno()
+            try:
+                self._tty_original = termios.tcgetattr(descriptor)
+                tty.setcbreak(descriptor)
+            except (termios.error, ValueError, OSError):
+                self._tty_original = None
+                LOGGER.debug("stdin does not support cbreak; keyboard controls disabled")
+                return False
+            return True
+
+    def _leave_cbreak(self) -> None:
+        """Put the terminal back the way it was found.  Safe to call twice."""
+
+        import termios
+
+        with self._tty_lock:
+            original = self._tty_original
+            self._tty_original = None
+        if original is None:
             return
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, original)
+        except (termios.error, ValueError, OSError):
+            LOGGER.warning("could not restore the terminal mode; `reset` will fix it")
+
+    def _watch_keys(self) -> None:
+        """Read single keypresses until the run ends.
+
+        Deliberately owns no terminal state: :meth:`stop` has already restored
+        the mode by the time this thread is killed at exit.
+        """
 
         try:
-            tty.setcbreak(descriptor)
             while not self._stop.is_set():
                 if self._suspend_keys.is_set():
-                    termios.tcsetattr(descriptor, termios.TCSADRAIN, original)
-                    while self._suspend_keys.is_set() and not self._stop.is_set():
-                        time.sleep(0.1)
-                    if not self._stop.is_set():
-                        tty.setcbreak(descriptor)
+                    time.sleep(0.1)
                     continue
 
                 readable, _, _ = select.select([sys.stdin], [], [], 0.2)
@@ -190,15 +248,18 @@ class RunController:
         except ForcedTermination:
             # Raised on the watcher thread; signal the main thread to unwind.
             os.kill(os.getpid(), signal.SIGINT)
-        finally:
-            try:
-                termios.tcsetattr(descriptor, termios.TCSADRAIN, original)
-            except termios.error:
-                pass
+        except (OSError, ValueError):
+            # stdin closed under us; signals still work.
+            LOGGER.debug("the key reader lost stdin")
 
 
 class _QuietKeys:
-    """Suspends raw key reading so a normal ``input()`` prompt works."""
+    """Suspends raw key reading so a normal ``input()`` prompt works.
+
+    Both halves run on the calling thread: the prompt needs the terminal back
+    in canonical mode to echo what is typed, and the reader has to be parked
+    first or it eats the Enter that ends the prompt.
+    """
 
     def __init__(self, controller: RunController) -> None:
         self.controller = controller
@@ -206,6 +267,9 @@ class _QuietKeys:
     def __enter__(self) -> None:
         self.controller._suspend_keys.set()
         time.sleep(0.05)
+        self.controller._leave_cbreak()
 
     def __exit__(self, *exc_info: object) -> None:
+        if self.controller._allow_keys and not self.controller._stop.is_set():
+            self.controller._enter_cbreak()
         self.controller._suspend_keys.clear()
