@@ -230,11 +230,24 @@ automatically: they might be two people, and a rule clever enough to join them
 is also clever enough to join two real authors who share a surname. Only an
 author ASIN, or `forge authors --link`, settles that case — once, permanently.
 
-Collaborations get one shelf per line-up, order-insensitively: a book tagged
-`Terry Maggert, J. N. Chaney` joins the existing `J.N. Chaney, Terry Maggert`
-folder rather than starting a fourth spelling of the same partnership. The
-billing order in the tag is left as Audible gives it, because that is
-information.
+Collaborations get one shelf per line-up. A folder that already names the same
+people is reused whatever order it used, so nothing already shelved is renamed
+for the sake of it; when a folder has to be created, the names are listed
+**alphabetically** — by the whole name as written, first name first, with no
+guessing at which part is a surname. Audible bills the same pair in a different
+order from one book to the next, and without this that makes a second shelf for
+the same two people.
+
+The **tag keeps its billing order**. Only the folder name is sorted: the order
+Audible lists authors in is information, and not forge's to rewrite.
+
+Not every comma separates two people. `L. E. Modesitt, Jr.` is one author, and
+reading that comma as a separator gave Audiobookshelf an author called `Jr.`
+with 39 books in this library. A comma-separated part that is *only* a name
+suffix — `Jr`, `Sr`, `II`, `III`, `IV`, `PhD`, `MD`, `Esq` and friends, an
+explicit list rather than a guess — rejoins the name before it. A real
+co-author after a suffix still splits correctly:
+`Martin Luther King, Jr., Coretta Scott King` is two people.
 
 Triage flags an author forge has never identified: the name shows **yellow** in
 the `author` column, and the detail panel says `★ new author … this spelling

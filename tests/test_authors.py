@@ -10,6 +10,7 @@ from forge.authors import (
     SCHEMA_VERSION,
     AuthorRegistry,
     Contributor,
+    folder_order,
     join_authors,
     name_key,
     shelf_key,
@@ -44,6 +45,45 @@ class Keys(unittest.TestCase):
 
     def test_joining_keeps_order_and_drops_repeats(self) -> None:
         self.assertEqual(join_authors(["B", "A", "B"]), "B, A")
+
+    def test_a_name_suffix_is_not_a_second_author(self) -> None:
+        # "L. E. Modesitt, Jr." is one man and 39 books here are his; reading
+        # that comma as a separator gave Audiobookshelf an author called "Jr."
+        self.assertEqual(split_authors("L. E. Modesitt, Jr."), ["L. E. Modesitt, Jr."])
+        self.assertEqual(split_authors("L. E. Modesitt, Jr"), ["L. E. Modesitt, Jr"])
+
+    def test_a_suffix_does_not_swallow_a_real_co_author(self) -> None:
+        self.assertEqual(
+            split_authors("Martin Luther King, Jr., Coretta Scott King"),
+            ["Martin Luther King, Jr.", "Coretta Scott King"],
+        )
+
+    def test_a_suffix_first_is_still_a_name(self) -> None:
+        # Nothing to rejoin to, so it stays as it is rather than vanishing.
+        self.assertEqual(split_authors("Jr., Someone"), ["Jr.", "Someone"])
+
+    def test_an_honorific_within_a_name_is_left_alone(self) -> None:
+        self.assertEqual(split_authors("Someone III"), ["Someone III"])
+        self.assertEqual(split_authors("Charles Dickens, BBC"), ["Charles Dickens", "BBC"])
+
+    def test_a_folder_lists_collaborators_alphabetically(self) -> None:
+        # By the whole name as written, first name first: no guessing at which
+        # part is a surname.
+        self.assertEqual(
+            folder_order(["John Anderson", "Andrew Johnson"]),
+            ["Andrew Johnson", "John Anderson"],
+        )
+
+    def test_folder_order_ignores_case(self) -> None:
+        self.assertEqual(
+            folder_order(["eden Hudson", "James Hunter"]),
+            ["eden Hudson", "James Hunter"],
+        )
+
+    def test_folder_order_is_the_same_whichever_way_they_arrive(self) -> None:
+        one = folder_order(split_authors("Terry Maggert, J.N. Chaney"))
+        two = folder_order(split_authors("J.N. Chaney, Terry Maggert"))
+        self.assertEqual(one, two)
 
     def test_a_collaboration_is_the_same_shelf_in_either_order(self) -> None:
         self.assertEqual(

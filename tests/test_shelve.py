@@ -497,6 +497,61 @@ class CanonicalAuthors(ShelveCase):
             plan.target.parent.parent.name, "J.N. Chaney, Terry Maggert"
         )
 
+    def test_a_new_collaboration_is_filed_alphabetically(self) -> None:
+        # Audible bills the same pair in whatever order it likes, so the folder
+        # name is sorted to stop that making two shelves.
+        path = self.book(
+            "book.m4b", author="Terry Maggert, JN Chaney", album="A Book"
+        )
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        self.assertEqual(
+            plan.target.relative_to(self.library).parts[0],
+            "J.N. Chaney, Terry Maggert",
+        )
+
+    def test_the_tag_keeps_the_order_it_was_billed_in(self) -> None:
+        # Only the folder is sorted.  The billing order is information.
+        path = self.book(
+            "book.m4b", author="Terry Maggert, JN Chaney", album="A Book"
+        )
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        self.assertEqual(plan.tag_fixes.get("author"), "Terry Maggert, J.N. Chaney")
+
+        result = shelve_mod.execute(plan, self.cfg)
+        self.assertEqual(
+            tags.read_metadata(result.destination).author, "Terry Maggert, J.N. Chaney"
+        )
+
+    def test_an_existing_shelf_wins_whatever_order_it_used(self) -> None:
+        # Nothing already shelved is renamed for the sake of alphabetising it.
+        (self.library / "Terry Maggert, J.N. Chaney").mkdir(parents=True)
+        path = self.book(
+            "book.m4b", author="J.N. Chaney, Terry Maggert", album="A Book"
+        )
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), registry=self.registry()
+        )
+        self.assertEqual(
+            plan.target.relative_to(self.library).parts[0],
+            "Terry Maggert, J.N. Chaney",
+        )
+
+    def test_a_name_suffix_does_not_become_a_second_author(self) -> None:
+        # One shelf, not "Jr., L. E. Modesitt".  The trailing full stop is
+        # dropped by library_component, because a folder name may not end in
+        # one on Windows - which is why the live folder is "…, Jr" already.
+        path = self.book(
+            "book.m4b", author="L. E. Modesitt, Jr.", album="A Book"
+        )
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertEqual(
+            plan.target.relative_to(self.library).parts[0], "L. E. Modesitt, Jr"
+        )
+
     def test_a_different_line_up_gets_its_own_shelf(self) -> None:
         (self.library / "J.N. Chaney, Terry Maggert").mkdir(parents=True)
         path = self.book("book.m4b", author="JN Chaney", album="A Book")

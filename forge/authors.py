@@ -111,6 +111,24 @@ _NOISE = re.compile(r"[^0-9a-z]+")
 #: ("Tao Wong; Jason J. Willis"), so both split.
 _SEPARATORS = re.compile(r"\s*[;,]\s*")
 
+#: Not every comma separates two people.  "L. E. Modesitt, Jr." is one author
+#: and 39 books here are by him; splitting on that comma makes "Jr." an author
+#: of its own, which Audiobookshelf then shelves as a person.  An explicit list
+#: rather than a guess, in the same spirit as the role credits above: a part
+#: that is *only* one of these rejoins the name before it.
+NAME_SUFFIXES = (
+    "jr", "jr.", "jnr", "jnr.",
+    "sr", "sr.", "snr", "snr.",
+    "ii", "iii", "iv", "v", "vi",
+    "phd", "ph.d", "ph.d.", "md", "m.d", "m.d.", "dds", "dvm",
+    "esq", "esq.", "mba", "ma", "ba", "bsc", "msc", "rn", "jd", "edd",
+    "ret", "ret.",
+)
+#: Matched with and without a trailing full stop, so "Jr" and "Jr." both count.
+_SUFFIX_SET = frozenset(suffix.rstrip(".") for suffix in NAME_SUFFIXES) | frozenset(
+    NAME_SUFFIXES
+)
+
 SOURCE_AUDIBLE = "audible"
 #: Audible named the author but gave no contributor id, so the identity is
 #: derived from the name.  Recorded separately because a backfill could promote
@@ -136,17 +154,56 @@ def name_key(name: str) -> str:
 
 
 def split_authors(value: str | None) -> list[str]:
-    """One author tag into its contributors, in the order they were billed."""
+    """One author tag into its contributors, in the order they were billed.
+
+    A part that is nothing but a name suffix belongs to the name before it:
+    "L. E. Modesitt, Jr." is one author, not two, and treating "Jr." as a
+    person puts him on two shelves and gives Audiobookshelf an author called
+    Jr.  See :data:`NAME_SUFFIXES`.
+    """
 
     if not value:
         return []
-    return [part.strip() for part in _SEPARATORS.split(value) if part.strip()]
+
+    names: list[str] = []
+    for part in _SEPARATORS.split(value):
+        part = part.strip()
+        if not part:
+            continue
+        if names and _is_name_suffix(part):
+            names[-1] = f"{names[-1]}, {part}"
+            continue
+        names.append(part)
+    return names
+
+
+def _is_name_suffix(part: str) -> bool:
+    """True when a comma-separated part is a suffix rather than a person."""
+
+    folded = part.casefold()
+    return folded in _SUFFIX_SET or folded.rstrip(".") in _SUFFIX_SET
 
 
 def join_authors(names: Iterable[str]) -> str:
     """Contributors back into a tag, keeping order and dropping repeats."""
 
     return ", ".join(dict.fromkeys(name.strip() for name in names if name.strip()))
+
+
+def folder_order(names: Iterable[str]) -> list[str]:
+    """Contributors in the order a folder name should list them.
+
+    Alphabetical, by the whole name as written - first name first, with no
+    attempt to work out which part is a surname.  Audible lists collaborators
+    in no consistent order, so two books by the same pair arrive billed two
+    ways and would otherwise make two shelves.  Sorting makes the folder name a
+    function of who wrote the book and nothing else.
+
+    The *tag* keeps its billing order: that is information, and it is not
+    forge's to rewrite.
+    """
+
+    return sorted((name.strip() for name in names if name.strip()), key=str.casefold)
 
 
 def shelf_key(value: str | None) -> frozenset[str]:

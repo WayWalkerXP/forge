@@ -269,6 +269,15 @@ def library_path(
     author = clean_author(meta.author or meta.albumartist)
     if registry is not None:
         author = registry.resolve(author).canonical or author
+    # The folder lists collaborators alphabetically; the tag keeps the order it
+    # was billed in.  Audible gives the same pair in a different order from one
+    # book to the next, which without this makes a second shelf for the same
+    # two people.  Only the name computed here is ordered: an existing folder
+    # naming the same people wins, whatever order it used, so nothing already
+    # shelved is renamed for the sake of it.
+    author = authors_mod.join_authors(
+        authors_mod.folder_order(authors_mod.split_authors(author))
+    )
     album = (meta.album or meta.title or "").strip()
     series = (meta.series or "").strip()
     part = format_series_part(meta.series_sequence)
