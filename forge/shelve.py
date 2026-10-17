@@ -32,6 +32,7 @@ from typing import Callable, Iterable, Sequence
 from . import authors as authors_mod
 from . import library as library_mod
 from . import tags as tags_mod
+from . import titles as titles_mod
 from .archive import move_into_library
 from .config import Config
 from .errors import ForgeError
@@ -259,6 +260,7 @@ def library_path(
     *,
     suffix: str = ".m4b",
     registry: "authors_mod.AuthorRegistry | None" = None,
+    phrases: Sequence[str] = (),
 ) -> Path:
     """Where *meta* belongs under *root*.
 
@@ -278,7 +280,9 @@ def library_path(
     author = authors_mod.join_authors(
         authors_mod.folder_order(authors_mod.split_authors(author))
     )
-    album = (meta.album or meta.title or "").strip()
+    # The folder is named from the same cleaned-up title that goes into the
+    # tag, or the shelf would still advertise "A LitRPG Adventure".
+    album = (titles_mod.strip_phrases(meta.album or meta.title, phrases) or "").strip()
     series = (meta.series or "").strip()
     part = format_series_part(meta.series_sequence)
     year = _year_of(meta)
@@ -512,6 +516,7 @@ def tag_fixes_for(
     meta: tags_mod.BookMetadata,
     *,
     registry: "authors_mod.AuthorRegistry | None" = None,
+    phrases: Sequence[str] = (),
 ) -> dict[str, object]:
     """The tag edits a book needs before it goes into the library.
 
@@ -541,6 +546,17 @@ def tag_fixes_for(
             cleaned = registry.resolve(cleaned).canonical or cleaned
         if cleaned != current:
             fixes[field_name] = cleaned
+    # Marketing out of the title.  Both fields, because they hold the same
+    # thing for a book and anything reading one will disagree with the other
+    # otherwise.  The subtitle is left alone: that is where this text belongs.
+    for field_name in ("title", "album"):
+        current = getattr(meta, field_name, None)
+        if not current:
+            continue
+        cleaned = titles_mod.strip_phrases(current, phrases)
+        if cleaned and cleaned != current:
+            fixes[field_name] = cleaned
+
     if meta.track is not None:
         fixes["track"] = None
     return fixes
@@ -553,6 +569,7 @@ def plan_book(
     client: library_mod.AudiobookshelfClient | None = None,
     reserved: set[Path] | None = None,
     registry: "authors_mod.AuthorRegistry | None" = None,
+    phrases: Sequence[str] = (),
 ) -> ShelvePlan:
     """Decide what shelving *path* would do.  Never writes anything."""
 
@@ -608,7 +625,11 @@ def plan_book(
         match_existing_case(
             cfg.library_dir,
             library_path(
-                cfg.library_dir, meta, suffix=path.suffix.casefold(), registry=registry
+                cfg.library_dir,
+                meta,
+                suffix=path.suffix.casefold(),
+                registry=registry,
+                phrases=phrases,
             ),
             registry=registry,
         ),
@@ -618,7 +639,7 @@ def plan_book(
         source=path,
         status=ShelveStatus.READY,
         target=target,
-        tag_fixes=tag_fixes_for(meta, registry=registry),
+        tag_fixes=tag_fixes_for(meta, registry=registry, phrases=phrases),
         book_key=key,
     )
 
@@ -629,13 +650,17 @@ def plan_many(
     *,
     client: library_mod.AudiobookshelfClient | None = None,
     registry: "authors_mod.AuthorRegistry | None" = None,
+    phrases: Sequence[str] = (),
 ) -> list[ShelvePlan]:
     """Plan a whole batch, so two books cannot be sent to the same name."""
 
     reserved: set[Path] = set()
     plans: list[ShelvePlan] = []
     for path in paths:
-        plan = plan_book(path, cfg, client=client, reserved=reserved, registry=registry)
+        plan = plan_book(
+            path, cfg, client=client, reserved=reserved, registry=registry,
+            phrases=phrases,
+        )
         if plan.target is not None:
             reserved.add(plan.target)
         plans.append(plan)

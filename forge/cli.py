@@ -167,6 +167,12 @@ def build_parser() -> argparse.ArgumentParser:
         "still answers from what it already knows",
     )
     shelve.add_argument(
+        "--no-title-cleanup",
+        action="store_true",
+        help="keep the title exactly as tagged, without removing the phrases "
+        "listed by `forge titles`",
+    )
+    shelve.add_argument(
         "--no-canonical-authors",
         action="store_true",
         help="shelve under the author spelling in the tags, without consulting "
@@ -261,6 +267,39 @@ def build_parser() -> argparse.ArgumentParser:
     backfill_cmd.add_argument("--csv", type=Path, metavar="FILE", help="write the plan to a CSV file")
     backfill_cmd.add_argument(
         "--show", type=int, default=20, help="how many planned changes to print"
+    )
+
+    titles_cmd = sub.add_parser(
+        "titles",
+        help="phrases to remove from book titles",
+        description="Publishers put series names, genres and formats in the title "
+        "field: \"The Land: A LitRPG Adventure\". No rule can tell marketing from a "
+        "title, so this is the list of phrases you have said are not part of one. "
+        "They are removed when a book is shelved, from the title and album tags and "
+        "so from the folder name; the subtitle is left alone.",
+        parents=[shared],
+    )
+    titles_cmd.add_argument(
+        "--add", action="append", metavar="PHRASE", help="add a phrase (repeatable)"
+    )
+    titles_cmd.add_argument(
+        "--remove", action="append", metavar="PHRASE", help="remove a phrase (repeatable)"
+    )
+    titles_cmd.add_argument(
+        "--test", metavar="TITLE", help="show what this title would become"
+    )
+    titles_cmd.add_argument(
+        "--suggest",
+        action="store_true",
+        help="read the library and list text that trails several titles, as candidates",
+    )
+    titles_cmd.add_argument(
+        "--limit", type=int, default=30, help="how many suggestions to show"
+    )
+    titles_cmd.add_argument(
+        "--report",
+        action="store_true",
+        help="print the list instead of opening the editor",
     )
 
     authors_cmd = sub.add_parser(
@@ -647,12 +686,20 @@ def cmd_shelve(args: argparse.Namespace) -> int:
 
         # Identities first, because the canonical author name decides both the
         # tags that get written and the shelf they are written to.
-        with _author_registry(cfg, enabled=not args.no_canonical_authors) as registry:
+        from .titles import PhraseStore
+
+        with _author_registry(cfg, enabled=not args.no_canonical_authors) as registry, \
+                PhraseStore(cfg.titles_db_path) as titles:
+            phrases = () if args.no_title_cleanup else tuple(titles.phrases())
+            if phrases:
+                renderer.info(f"title cleanup: {len(phrases)} phrase(s) to remove")
             if registry is not None:
                 with _audible_for_identities(renderer, args) as audible:
                     outcome = shelve_mod.learn_identities(paths, registry, audible)
                 renderer.info(f"author identities: {outcome.describe()}")
-            plans = shelve_mod.plan_many(paths, cfg, client=client, registry=registry)
+            plans = shelve_mod.plan_many(
+                paths, cfg, client=client, registry=registry, phrases=phrases
+            )
 
             if args.dry_run or args.csv:
                 renderer.shelve_table(plans)
@@ -1191,6 +1238,112 @@ def _record_history(args: argparse.Namespace, path: Path, changes: dict, *, sour
         LOGGER.debug("could not record history for %s", path, exc_info=True)
 
 
+def cmd_titles(args: argparse.Namespace) -> int:
+    """Manage the phrases removed from book titles."""
+
+    from . import render
+    from .titles import PhraseStore, strip_phrases, suggest_phrases
+
+    cfg = _load_config(args)
+
+    # With nothing else asked for, this is an editing session.  A pipe or a
+    # cron job still gets the list, and --report forces it.
+    interactive = sys.stdout.isatty() and not any(
+        (args.add, args.remove, args.test, args.suggest, args.report, args.plain)
+    )
+    if interactive:
+        from .tui.titles_app import run_phrase_review
+
+        return run_phrase_review(cfg)
+
+    renderer = render.make_renderer(force_plain=args.plain, no_color=args.no_color)
+
+    with PhraseStore(cfg.titles_db_path) as store:
+        changed = False
+        for phrase in args.remove or []:
+            if store.remove(phrase):
+                renderer.info(f"removed {phrase!r}")
+            else:
+                renderer.warn(f"{phrase!r} was not on the list")
+            changed = True
+        for phrase in args.add or []:
+            try:
+                added = store.add(phrase)
+            except ValueError as exc:
+                renderer.warn(str(exc))
+                return EXIT_USAGE
+            renderer.info(
+                f"added {phrase!r}" if added else f"{phrase!r} was already on the list"
+            )
+            changed = True
+
+        if args.test is not None:
+            cleaned = strip_phrases(args.test, store.phrases())
+            renderer.info(f"{args.test!r}")
+            if cleaned == args.test:
+                renderer.info("    unchanged — no phrase on the list appears in it")
+            else:
+                renderer.info(f" -> {cleaned!r}")
+            return EXIT_OK
+
+        if args.suggest:
+            return _suggest_title_phrases(cfg, store, renderer, args.limit)
+
+        phrases = store.phrases()
+        if not phrases:
+            renderer.info(
+                "no phrases yet — add one with: "
+                "forge titles --add \"A LitRPG Adventure\""
+            )
+            return EXIT_OK
+        if not changed:
+            renderer.info(f"{len(phrases)} phrase(s) removed from titles when shelving:")
+        for phrase in phrases:
+            renderer.info(f"  {phrase}")
+        return EXIT_OK
+
+
+def _suggest_title_phrases(cfg, store, renderer, limit: int) -> int:
+    """Read the library and report text that trails a lot of titles."""
+
+    from . import backfill as backfill_mod
+    from . import tags as tags_mod
+    from .errors import ConfigError
+    from .titles import phrase_key, suggest_phrases
+
+    if cfg.library_dir is None:
+        raise ConfigError("no library directory to read; set [paths] library_dir")
+
+    renderer.info(f"reading titles from {cfg.library_dir}…")
+    titles: list[str] = []
+    for path in backfill_mod.find_books(cfg.library_dir):
+        try:
+            meta = tags_mod.read_metadata(path)
+        except Exception:
+            continue
+        name = meta.album or meta.title
+        if name:
+            titles.append(name)
+
+    known = {phrase_key(phrase) for phrase in store.phrases()}
+    suggestions = [
+        (phrase, count)
+        for phrase, count in suggest_phrases(titles)
+        if phrase_key(phrase) not in known
+    ]
+    renderer.info(f"{len(titles)} title(s) read; {len(suggestions)} candidate(s)")
+    renderer.info("")
+    for phrase, count in suggestions[:limit]:
+        renderer.info(f"  {count:4}  {phrase}")
+    renderer.info("")
+    renderer.info(
+        "nothing is added automatically — \"Book 2\" trails plenty of titles and "
+        "belongs to none of them.  Add the ones you want with: "
+        "forge titles --add \"...\""
+    )
+    return EXIT_OK
+
+
 def cmd_backfill(args: argparse.Namespace) -> int:
     """Reconcile an existing library with the author registry."""
 
@@ -1445,6 +1598,7 @@ _HANDLERS = {
     "history": cmd_history,
     "undo": cmd_undo,
     "authors": cmd_authors,
+    "titles": cmd_titles,
     "backfill": cmd_backfill,
 }
 

@@ -955,6 +955,7 @@ class ScreenConstruction(unittest.TestCase):
             EditNameScreen,
             UnsavedChangesScreen,
         )
+        from forge.tui.title_screens import EditPhraseScreen, TestTitleScreen
         from forge.tui.screens import (
             AudibleScreen,
             CompareScreen,
@@ -982,6 +983,9 @@ class ScreenConstruction(unittest.TestCase):
              lambda: EditNameScreen("B0", "A Name", ["A Name", "Another"])),
             ("UnsavedChangesScreen", lambda: UnsavedChangesScreen(3)),
             ("AuthorSortScreen", lambda: AuthorSortScreen([("books", "most first")])),
+            ("EditPhraseScreen", lambda: EditPhraseScreen()),
+            ("EditPhraseScreen(current)", lambda: EditPhraseScreen("A LitRPG Adventure")),
+            ("TestTitleScreen", lambda: TestTitleScreen(["A LitRPG Adventure"])),
         ):
             with self.subTest(screen=label):
                 build()  # must not raise
@@ -992,11 +996,12 @@ class ScreenConstruction(unittest.TestCase):
         from textual.screen import ModalScreen
         from forge.tui import author_screens as author_screens_mod
         from forge.tui import screens as screens_mod
+        from forge.tui import title_screens as title_screens_mod
 
         offenders: list[str] = []
         candidates = [
             (name, cls)
-            for module in (screens_mod, author_screens_mod)
+            for module in (screens_mod, author_screens_mod, title_screens_mod)
             for name, cls in vars(module).items()
             if inspect.isclass(cls)
             and issubclass(cls, ModalScreen)
@@ -1713,6 +1718,7 @@ class ScreenLayout(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
             EditNameScreen,
             UnsavedChangesScreen,
         )
+        from forge.tui.title_screens import EditPhraseScreen, TestTitleScreen
         from forge.tui.screens import (
             CompareScreen,
             ConfirmScreen,
@@ -1745,6 +1751,12 @@ class ScreenLayout(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
                 ("AuthorSortScreen",
                  lambda: AuthorSortScreen([(f"order{i}", "why") for i in range(6)]),
                  ["#direction", "#choice-0", "#hint"]),
+                ("EditPhraseScreen",
+                 lambda: EditPhraseScreen("A LitRPG Adventure"),
+                 ["#row", "#preview", "#buttons", "#hint"]),
+                ("TestTitleScreen",
+                 lambda: TestTitleScreen(["A LitRPG Adventure"]),
+                 ["#row", "#result", "#hint"]),
             ):
                 app.push_screen(build())
                 await pilot.pause(0.2)

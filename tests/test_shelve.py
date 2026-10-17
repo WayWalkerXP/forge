@@ -568,6 +568,71 @@ class CanonicalAuthors(ShelveCase):
 
 
 @requires_ffmpeg
+class CleaningTitles(ShelveCase):
+    """Marketing out of the title, and out of the folder name with it."""
+
+    PHRASES = ("A LitRPG Adventure",)
+
+    def test_the_title_and_album_are_both_cleaned(self) -> None:
+        path = self.book(
+            "book.m4b",
+            author="An Author",
+            album="The Land: A LitRPG Adventure",
+            title="The Land: A LitRPG Adventure",
+        )
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), phrases=self.PHRASES
+        )
+        self.assertEqual(plan.tag_fixes.get("album"), "The Land")
+        self.assertEqual(plan.tag_fixes.get("title"), "The Land")
+
+    def test_the_folder_follows_the_cleaned_title(self) -> None:
+        path = self.book(
+            "book.m4b", author="An Author", album="The Land (A LitRPG Adventure)"
+        )
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), phrases=self.PHRASES
+        )
+        self.assertEqual(
+            plan.target.relative_to(self.library).parts[1:],
+            ("The Land", "The Land.m4b"),
+        )
+
+    def test_the_subtitle_is_left_alone(self) -> None:
+        path = self.book(
+            "book.m4b",
+            author="An Author",
+            album="The Land: A LitRPG Adventure",
+            subtitle="A LitRPG Adventure",
+        )
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), phrases=self.PHRASES
+        )
+        self.assertNotIn("subtitle", plan.tag_fixes)
+
+    def test_shelving_writes_the_cleaned_title(self) -> None:
+        path = self.book(
+            "book.m4b", author="An Author", album="The Land: A LitRPG Adventure"
+        )
+        plan = shelve_mod.plan_book(
+            path, self.cfg, client=self.client(), phrases=self.PHRASES
+        )
+        result = shelve_mod.execute(plan, self.cfg)
+        self.assertEqual(tags.read_metadata(result.destination).album, "The Land")
+
+    def test_with_no_phrases_the_title_is_untouched(self) -> None:
+        path = self.book(
+            "book.m4b", author="An Author", album="The Land: A LitRPG Adventure"
+        )
+        plan = shelve_mod.plan_book(path, self.cfg, client=self.client())
+        self.assertNotIn("album", plan.tag_fixes)
+        self.assertEqual(
+            plan.target.relative_to(self.library).parts[1],
+            "The Land_ A LitRPG Adventure",
+        )
+
+
+@requires_ffmpeg
 class LearningIdentities(ShelveCase):
     """The sweep that fills the registry before anything is planned."""
 

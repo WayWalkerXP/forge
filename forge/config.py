@@ -97,6 +97,17 @@ class Config:
         return self.state_dir / "history.sqlite3"
 
     @property
+    def titles_db_path(self) -> Path:
+        """The phrases to strip from book titles.
+
+        Its own file for the same reason as the author registry: separate
+        schemas, separate lifetimes, and no migration of one able to touch the
+        other.
+        """
+
+        return self.state_dir / "titles.sqlite3"
+
+    @property
     def authors_db_path(self) -> Path:
         """The author identity registry.
 

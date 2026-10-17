@@ -153,6 +153,60 @@ A few details chosen deliberately:
 * **A completed batch clears the marks it acted on**, since a stale mark is what
   would make the *next* `space` write the wrong thing.
 
+### Marketing out of the title
+
+Publishers use the title field as advertising space, so the same book arrives as
+`The Land: A LitRPG Adventure`, `The Land (A LitRPG Adventure)` or
+`The Land - A LitRPG Adventure`. No rule can tell marketing from a title, so
+forge keeps a list of phrases *you* have said are not part of one, in
+`state_dir/titles.sqlite3`.
+
+Each phrase is removed with whatever punctuation was holding it on — a colon, a
+dash, a bracket pair — back to the end of the real title. A question mark or
+exclamation mark that touches the title survives, because it belongs to the
+title:
+
+```
+"What Could Go Wrong?: A LitRPG Adventure"  ->  "What Could Go Wrong?"
+"The Land: A LitRPG Adventure!"             ->  "The Land"
+"The Land (Deluxe Edition): A LitRPG…"      ->  "The Land (Deluxe Edition)"
+```
+
+The second loses its `!` because a colon and a space stand between it and the
+title — it was punctuating the marketing. The third keeps its bracket, because
+the text inside it opened one.
+
+It applies to the `title` and `album` tags, which hold the same thing for a
+book, and so to the folder name, which comes from `album`. **The subtitle is
+left alone**: that is where this text belongs, and Audiobookshelf shows it
+separately. A phrase that would leave nothing at all is not removed — a book
+with no title has no name and no shelf, while an untidy title is merely untidy.
+
+It runs when a book is **shelved**, so it applies to future books only; nothing
+already in the library is retitled. `forge shelve --no-title-cleanup` skips it.
+
+| command | what it does |
+|---|---|
+| `forge titles` | the editor (or the list when not a terminal) |
+| `forge titles --report` | print the list |
+| `forge titles --add "A LitRPG Adventure"` | add a phrase (repeatable) |
+| `forge titles --remove "..."` | remove one |
+| `forge titles --test "The Land: A LitRPG Adventure"` | show what a title would become |
+| `forge titles --suggest` | read the library and list text that trails several titles, as candidates |
+
+The editor works like `forge authors`: `a` adds, `e` edits, `d` deletes, `u`
+drops every unsaved change, `t` tries a title of your own against the list, `/`
+searches, `o` sorts, `s` saves with a confirmation, and quitting with unsaved
+work offers save / discard / stay. The add and edit dialog previews what the
+phrase would do to an example title as you type.
+
+Deleting **is** allowed here, unlike an author identity: a phrase is a decision
+about text rather than a record of anything, and the worst a wrong deletion
+costs is that the next book keeps its marketing.
+
+`--suggest` never adds anything by itself. `Book 2` trails plenty of titles and
+belongs to none of them.
+
 ### Ordering the list
 
 `s` opens the sort dialog. A number or the arrow keys picks the column, `r`
