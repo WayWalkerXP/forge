@@ -187,6 +187,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--csv", type=Path, metavar="FILE", help="also write the plan to a CSV file"
     )
 
+    naming_cmd = sub.add_parser(
+        "naming",
+        help="show the filename templates, the tags they may use, and an example",
+        parents=[shared],
+    )
+    naming_cmd.add_argument(
+        "path",
+        nargs="?",
+        type=Path,
+        help="name this book with the configured templates instead of the example",
+    )
+
     listing = sub.add_parser("list", help="show the books in the source directory", parents=[shared])
     listing.add_argument("directory", nargs="?", type=Path)
     listing.add_argument("-d", "--disposition", help="filter by disposition")
@@ -823,6 +835,60 @@ def _write_shelve_csv(path: Path, plans: list, csv_mod) -> None:
                     plan.reason or "; ".join(plan.fix_notes()),
                 ]
             )
+
+
+def cmd_naming(args: argparse.Namespace) -> int:
+    """Show what the two templates are and what they would produce.
+
+    Both are validated by loading the config, so this doubles as the way to
+    check a template before a run uses it: an unusable one exits 3 here and
+    says which setting is wrong.
+    """
+
+    from . import naming, render, tags as tags_mod
+    from .tags import BookMetadata
+
+    cfg = _load_config(args)
+    renderer = render.make_renderer(force_plain=args.plain, no_color=args.no_color)
+    templates = naming.require(cfg)
+
+    renderer.info(f"shelf_template     {cfg.shelf_template}")
+    renderer.info(f"filename_template  {cfg.filename_template}")
+    renderer.info("")
+    renderer.info("available tags:")
+    for line in naming.tag_help_lines():
+        renderer.info(f"  {line}")
+    renderer.info("")
+
+    if args.path:
+        meta = tags_mod.read_metadata(args.path)
+        label = args.path.name
+    else:
+        meta = BookMetadata(
+            path="example.m4b",
+            author="David Eddings",
+            album="Pawn of Prophecy",
+            series="The Belgariad",
+            series_sequence="1",
+            published_year="1982",
+            asin="B002V0QUOA",
+        )
+        label = "example"
+
+    root = cfg.library_dir or Path("<library_dir>")
+    try:
+        where = naming.shelf_path(
+            root,
+            meta,
+            shelf_template=templates.shelf,
+            filename_template=templates.filename,
+        )
+    except naming.EmptyName as exc:
+        renderer.error(f"{label}: {exc}")
+        return EXIT_FAILURES
+    renderer.info(f"{label} would be filed as:")
+    renderer.info(f"  {where}")
+    return EXIT_OK
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -1592,6 +1658,7 @@ _HANDLERS = {
     "run": cmd_run,
     "shelve": cmd_shelve,
     "list": cmd_list,
+    "naming": cmd_naming,
     "tags": cmd_tags,
     "disposition": cmd_disposition,
     "lookup": cmd_lookup,

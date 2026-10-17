@@ -1,10 +1,9 @@
-"""Filename and path helpers.
+"""Path helpers: what a filename may contain, and finding a free one.
 
-Output names are built from tag values, which means they contain whatever a
-publisher or ripper decided to put in a tag: slashes, colons, trailing dots,
-emoji, and occasionally 400 characters of subtitle.  Everything here exists to
-turn that into a name that survives Linux, Windows, SMB shares, and the trip
-through Audiobookshelf.
+How a book's name is *composed* lives in :mod:`forge.naming`, which owns the
+two configurable templates.  What is left here is the plumbing around it - the
+character rules every name is held to, the collision suffix, and the
+in-progress and archive paths.
 """
 
 from __future__ import annotations
@@ -14,7 +13,9 @@ from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
 
-#: Illegal on Windows and troublesome on SMB shares even when the server is Linux.
+#: Illegal on Windows and troublesome on SMB shares even when the server is
+#: Linux.  :mod:`forge.naming` builds every name forge writes and reads these
+#: two from here, so there is one answer to "what may a filename contain".
 INVALID_CHARS = '<>:"/\\|?*\0'
 
 WINDOWS_RESERVED = frozenset(
@@ -22,60 +23,6 @@ WINDOWS_RESERVED = frozenset(
     | {f"COM{n}" for n in range(1, 10)}
     | {f"LPT{n}" for n in range(1, 10)}
 )
-
-#: Leaves room for a " (12)" collision suffix and a ".forge-tmp" prefix inside
-#: the 255-byte limit most filesystems impose on a single component.
-MAX_COMPONENT_LENGTH = 180
-
-
-def sanitize_filename(value: str, *, fallback: str = "Untitled") -> str:
-    """Make *value* safe to use as a single path component."""
-
-    if value is None:
-        return fallback
-
-    cleaned = "".join(" " if char in INVALID_CHARS else char for char in str(value))
-    cleaned = " ".join(cleaned.split())
-    # Windows cannot address a name ending in a dot or space, and such names are
-    # a nuisance to delete by hand even on Linux.
-    cleaned = cleaned.rstrip(" .")
-
-    if not cleaned:
-        return fallback
-
-    if cleaned.split(".")[0].upper() in WINDOWS_RESERVED:
-        cleaned = f"{cleaned}_"
-
-    if len(cleaned) > MAX_COMPONENT_LENGTH:
-        cleaned = cleaned[:MAX_COMPONENT_LENGTH].rstrip(" .")
-
-    return cleaned or fallback
-
-
-def output_filename(author: str | None, title: str | None, *, suffix: str = ".m4b") -> str:
-    """Build the ``Author - Title.m4b`` name used throughout the pipeline.
-
-    The whole name is budgeted against :data:`MAX_COMPONENT_LENGTH`, not each
-    half separately: a long author and a long title would otherwise combine into
-    a name that exceeds the 255-byte component limit on ext4 and fails at write
-    time.  The title is truncated first, since losing the end of a subtitle is
-    less confusing than losing part of an author's name.
-    """
-
-    safe_author = sanitize_filename(author, fallback="Unknown Author")
-    safe_title = sanitize_filename(title, fallback="Unknown Title")
-
-    budget = MAX_COMPONENT_LENGTH - len(suffix) - len(" - ")
-    if len(safe_author) + len(safe_title) <= budget:
-        return f"{safe_author} - {safe_title}{suffix}"
-
-    # Give the author at most half the budget, then let the title use the rest.
-    author_budget = min(len(safe_author), max(20, budget // 2))
-    safe_author = safe_author[:author_budget].rstrip(" .") or "Unknown Author"
-    title_budget = max(1, budget - len(safe_author))
-    safe_title = safe_title[:title_budget].rstrip(" .") or "Unknown Title"
-
-    return f"{safe_author} - {safe_title}{suffix}"
 
 
 def collision_safe_path(path: Path, *, reserved: set[Path] | None = None) -> Path:

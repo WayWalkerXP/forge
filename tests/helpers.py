@@ -170,6 +170,13 @@ def write_config(root: Path, **overrides: object) -> Path:
         for key in ("library_dir", "duplicates_dir")
         if settings.get(key) is not None
     )
+    # Omitted unless a test is about naming, so everything else exercises the
+    # defaults, which are what an existing install runs with.
+    templates = "\n            ".join(
+        f"{key} = {settings[key]}"
+        for key in ("shelf_template", "filename_template")
+        if settings.get(key) is not None
+    )
     path.write_text(
         textwrap.dedent(
             f"""
@@ -178,6 +185,9 @@ def write_config(root: Path, **overrides: object) -> Path:
             output_dir = {settings['output_dir']}
             archive_dir = {settings['archive_dir']}
             {optional}
+
+            [naming]
+            {templates}
 
             [encoding]
             max_bitrate = {settings['max_bitrate']}

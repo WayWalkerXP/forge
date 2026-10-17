@@ -17,6 +17,7 @@ from tests.helpers import TempCaseMixin, copy_audio, requires_ffmpeg, write_conf
 from tests.test_library import FakeSession
 
 from forge import config as config_mod
+from forge import naming
 from forge import shelve as shelve_mod
 from forge import tags
 from forge.errors import ConfigError
@@ -27,6 +28,13 @@ from forge.tags import BookMetadata
 
 def meta(**fields) -> BookMetadata:
     return BookMetadata(path="/nowhere.m4b", **fields)
+
+
+def library_path(root: Path, metadata: BookMetadata, **kwargs):
+    """``shelve.library_path`` with the stock templates, which these tests assert."""
+
+    kwargs.setdefault("templates", naming.default_templates())
+    return shelve_mod.library_path(root, metadata, **kwargs)
 
 
 class LibraryComponentNames(unittest.TestCase):
@@ -88,7 +96,7 @@ class LibraryPaths(unittest.TestCase):
     root = Path("/library")
 
     def test_the_full_shape(self) -> None:
-        path = shelve_mod.library_path(
+        path = library_path(
             self.root,
             meta(
                 author="Jonathan Brooks",
@@ -109,7 +117,7 @@ class LibraryPaths(unittest.TestCase):
         )
 
     def test_no_series_means_no_series_folder_and_no_part_prefix(self) -> None:
-        path = shelve_mod.library_path(
+        path = library_path(
             self.root, meta(author="Adrian Tchaikovsky", album="Ironclads", published_year=2017)
         )
         self.assertEqual(
@@ -117,38 +125,38 @@ class LibraryPaths(unittest.TestCase):
         )
 
     def test_no_year_and_no_asin(self) -> None:
-        path = shelve_mod.library_path(self.root, meta(author="A", album="B"))
+        path = library_path(self.root, meta(author="A", album="B"))
         self.assertEqual(path, self.root / "A" / "B" / "B.m4b")
 
     def test_the_year_falls_back_to_the_published_date(self) -> None:
-        path = shelve_mod.library_path(
+        path = library_path(
             self.root, meta(author="A", album="B", published_date="2019-04-02")
         )
         self.assertEqual(path.name, "B (2019).m4b")
 
     def test_the_author_folder_is_the_cleaned_author(self) -> None:
-        path = shelve_mod.library_path(
+        path = library_path(
             self.root, meta(author="Mary Smith - Translator, Bob Jones", album="B")
         )
         self.assertEqual(path.parts[2], "Bob Jones")
 
     def test_the_album_artist_is_used_when_there_is_no_author(self) -> None:
-        path = shelve_mod.library_path(self.root, meta(albumartist="A A", album="B"))
+        path = library_path(self.root, meta(albumartist="A A", album="B"))
         self.assertEqual(path.parts[2], "A A")
 
     def test_the_suffix_is_kept(self) -> None:
-        path = shelve_mod.library_path(self.root, meta(author="A", album="B"), suffix=".m4a")
+        path = library_path(self.root, meta(author="A", album="B"), suffix=".m4a")
         self.assertEqual(path.suffix, ".m4a")
 
     def test_a_very_long_title_still_fits_a_filesystem_component(self) -> None:
-        path = shelve_mod.library_path(self.root, meta(author="A", album="x" * 300))
+        path = library_path(self.root, meta(author="A", album="x" * 300))
         for part in path.parts:
             self.assertLessEqual(len(part.encode("utf-8")), 255, part)
 
     def test_a_long_filename_leaves_room_for_a_collision_marker(self) -> None:
         # Otherwise resolving a collision would produce a name too long to
         # write, turning a shelving into a failure at the last step.
-        path = shelve_mod.library_path(self.root, meta(author="A", album="x" * 300))
+        path = library_path(self.root, meta(author="A", album="x" * 300))
         self.assertLessEqual(len(f"{path.stem} (999){path.suffix}".encode()), 255)
 
 

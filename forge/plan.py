@@ -24,11 +24,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
-from . import rules
+from . import naming, rules
 from .config import Config
 from .disposition import Disposition
 from .errors import ProbeError
-from .paths import output_filename, relative_to_or_name, temp_output_path
+from .paths import relative_to_or_name, temp_output_path
 from .probe import AudioInfo, probe
 from .scan import Book
 from .tags import parse_int
@@ -113,6 +113,10 @@ def plan(book: Book, config: Config, *, codec: str | None = None) -> Plan:
     but makes the plan non-executable.
     """
 
+    # First, before anything is probed: the naming templates decide what this
+    # run produces, and an unusable one is a config error, not a book error.
+    templates = naming.require(config)
+
     warnings: list[str] = []
     errors: list[str] = []
     disposition = book.disposition
@@ -183,17 +187,31 @@ def plan(book: Book, config: Config, *, codec: str | None = None) -> Plan:
                       total_duration=total_duration, chapters=chapters)
 
     # --- naming ----------------------------------------------------------- #
-    author = book.author
-    title = book.title
-    if not author:
-        errors.append("missing author tag, so an output filename cannot be built")
-    if not title:
-        errors.append("missing album and title tags, so an output filename cannot be built")
+    # The same template that names the book in the library, so a conversion
+    # output does not have to be renamed to be shelved, and two books by one
+    # author sharing a title do not collide on "Author - Title.m4b".
+    #
+    # From the raw tags, not the canonical author or the cleaned-up title:
+    # planning is pure, and those come from databases that shelving opens.  A
+    # book whose title is tidied later is renamed by the move, which is what
+    # the move does anyway.
+    if not book.author:
+        errors.append("missing author tag, and a book with no author cannot be shelved")
+    if not book.title:
+        errors.append("missing album and title tags, so the book has no name")
     if errors:
         return result(PlanStatus.INVALID, target=target, source_info=source_info,
                       total_duration=total_duration, chapters=chapters)
 
-    name = output_filename(author, title)
+    assert book.metadata is not None  # implied by book.author and book.title
+    try:
+        name = naming.render_filename(
+            templates.filename, naming.tag_values(book.metadata)
+        )
+    except naming.EmptyName as exc:
+        errors.append(str(exc))
+        return result(PlanStatus.INVALID, target=target, source_info=source_info,
+                      total_duration=total_duration, chapters=chapters)
     output_path = config.output_dir / name
     temp_path = temp_output_path(output_path)
     archive_path = config.archive_dir / relative_to_or_name(book.path, config.source_dir)
@@ -231,10 +249,9 @@ def plan(book: Book, config: Config, *, codec: str | None = None) -> Plan:
 def plan_many(books: list[Book], config: Config, *, codec: str | None = None) -> list[Plan]:
     """Plan a batch, cross-checking for outputs that would collide.
 
-    Two books whose tags produce the same ``Author - Title`` would otherwise
-    race: the first converts, the second fails on "output already exists" only
-    after wasting a full transcode.  Catching it here makes both visible up
-    front.
+    Two books whose tags render to the same filename would otherwise race: the
+    first converts, the second fails on "output already exists" only after
+    wasting a full transcode.  Catching it here makes both visible up front.
     """
 
     plans = [plan(book, config, codec=codec) for book in books]

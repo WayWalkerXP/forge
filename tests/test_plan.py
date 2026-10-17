@@ -122,11 +122,33 @@ class PlanShape(TempCaseMixin):
         return plan_mod.plan(book, self.cfg, codec="aac")
 
     def test_paths_are_derived_from_the_tags(self) -> None:
-        item = self.single(metadata={"author": "An Author", "album": "A Title"})
-        self.assertEqual(item.output_path.name, "An Author - A Title.m4b")
-        self.assertEqual(item.temp_path.name, "An Author - A Title.tmp.m4b")
+        # The configured filename_template, the same one shelving uses, so the
+        # output already carries the name it will keep in the library.
+        item = self.single(metadata={
+            "author": "An Author", "album": "A Title",
+            "published_year": "1982", "asin": "B002V0QUOA",
+        })
+        self.assertEqual(item.output_path.name, "A Title (1982) [B002V0QUOA].m4b")
+        self.assertEqual(item.temp_path.name, "A Title (1982) [B002V0QUOA].tmp.m4b")
         self.assertEqual(item.output_path.parent, self.cfg.output_dir)
         self.assertEqual(item.archive_path.parent, self.cfg.archive_dir)
+
+    def test_the_configured_template_is_the_one_used(self) -> None:
+        # Proof that the setting reaches the converter, not just the shelver.
+        self.cfg = config_mod.load(
+            write_config(self.root, filename_template="<author> - <album> [<asin>]")
+        )
+        item = self.single(metadata={
+            "author": "An Author", "album": "A Title", "asin": "B002V0QUOA",
+        })
+        self.assertEqual(item.output_path.name, "An Author - A Title [B002V0QUOA].m4b")
+
+    def test_a_template_that_names_nothing_this_book_has_is_invalid(self) -> None:
+        # A book error, not a config error: the fix is to tag the book.
+        self.cfg = config_mod.load(write_config(self.root, filename_template="<series>"))
+        item = self.single(metadata={"author": "An Author", "album": "A Title"})
+        self.assertIs(item.status, plan_mod.PlanStatus.INVALID)
+        self.assertIn("<series>", " ".join(item.errors))
 
     def test_as_is_has_no_archive_path(self) -> None:
         # The file is the product, so there is no original to file away.
@@ -151,7 +173,7 @@ class PlanShape(TempCaseMixin):
     def test_a_plan_describes_itself(self) -> None:
         item = self.single(metadata={"author": "A", "album": "B"})
         self.assertIn("downcode", item.describe())
-        self.assertIn("A - B.m4b", item.describe())
+        self.assertIn("B.m4b", item.describe())
 
     def test_a_skipped_plan_describes_the_reason_once(self) -> None:
         item = self.single(disposition=D.HOLD, metadata={"author": "A", "album": "B"})

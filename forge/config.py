@@ -18,6 +18,7 @@ import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import naming
 from .errors import ConfigError
 
 LOGGER = logging.getLogger(__name__)
@@ -46,6 +47,13 @@ class Config:
     #: Where a book whose ASIN is already shelved is set aside.  Defaults to
     #: ``duplicates`` inside whatever directory shelve is reading.
     duplicates_dir: Path | None = None
+
+    #: How a book is named, for both ``forge run`` and ``forge shelve``.  One
+    #: convention for the whole pipeline: a conversion output is named with
+    #: ``filename_template`` and keeps that name when shelving adds the
+    #: directories from ``shelf_template``.  See :mod:`forge.naming`.
+    shelf_template: str = naming.DEFAULT_SHELF_TEMPLATE
+    filename_template: str = naming.DEFAULT_FILENAME_TEMPLATE
 
     max_bitrate_kbps: int = 64
     preferred_codec: str = "libfdk_aac"
@@ -266,6 +274,12 @@ def load(path: Path | str | None = None, *, create_dirs: bool = True) -> Config:
         archive_dir=_required_path(parser, "paths", "archive_dir"),
         library_dir=_optional_path(parser, "paths", "library_dir"),
         duplicates_dir=_optional_path(parser, "paths", "duplicates_dir"),
+        shelf_template=parser.get(
+            "naming", "shelf_template", fallback=naming.DEFAULT_SHELF_TEMPLATE
+        ).strip(),
+        filename_template=parser.get(
+            "naming", "filename_template", fallback=naming.DEFAULT_FILENAME_TEMPLATE
+        ).strip(),
         max_bitrate_kbps=_parse_int(parser, "encoding", "max_bitrate", 64),
         preferred_codec=parser.get("encoding", "codec", fallback="libfdk_aac").strip(),
         fallback_codec=parser.get("encoding", "fallback_codec", fallback="aac").strip(),
@@ -298,6 +312,11 @@ def validate(config: Config, *, create_dirs: bool = True) -> None:
         raise ConfigError("[safety] settle_seconds and min_age_seconds must not be negative")
     if config.extract_covers and config.cover_dir is None:
         raise ConfigError("[artwork] cover_dir is required when extract_covers is true")
+
+    # Before any directory is created, let alone written to: a template that
+    # cannot produce a legal name is a mistake in the file, and the only safe
+    # moment to say so is before the run starts.
+    naming.require(config)
 
     directories = [
         ("source_dir", config.source_dir),

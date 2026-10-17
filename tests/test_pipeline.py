@@ -110,7 +110,7 @@ class Downcode(PipelineCase):
         item, result = self.run_one(path)
 
         self.assertEqual(result.outcome, Outcome.CONVERTED)
-        output = self.cfg.output_dir / "Bob Kowalski - A History of Science.m4b"
+        output = self.cfg.output_dir / "A History of Science.m4b"
         self.assertTrue(output.exists())
 
         info = probe.probe(output)
@@ -337,7 +337,7 @@ class FolderBooks(PipelineCase):
         results = self.run_all()
 
         self.assertEqual(results[0].outcome, Outcome.CONVERTED)
-        output = self.cfg.output_dir / "Dean Koontz - Odd Thomas.m4b"
+        output = self.cfg.output_dir / "Odd Thomas.m4b"
         self.assertTrue(output.exists())
         self.assertEqual(probe.probe(output).chapter_count, 3)
 
@@ -467,7 +467,7 @@ class NoOverwrite(PipelineCase):
             "book.mp3", disposition=D.DOWNCODE,
             metadata={"author": "A", "album": "B"}, mp3=True, seconds=2,
         )
-        existing = self.cfg.output_dir / "A - B.m4b"
+        existing = self.cfg.output_dir / "B.m4b"
         existing.write_bytes(b"precious")
 
         item, result = self.run_one(path)

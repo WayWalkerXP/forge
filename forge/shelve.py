@@ -3,7 +3,8 @@
 The last step of the pipeline.  ``forge run`` produces a validated m4b in the
 output directory; ``forge shelve`` reads its tags, asks the library whether that
 edition is already shelved, tidies the two tags Audiobookshelf reads wrongly,
-and moves the file to::
+and moves the file to where the configured templates say it belongs, by
+default::
 
     <library>/<Author>/<Series>/<NN - Album>/<Album (year) [asin]>.m4b
 
@@ -11,13 +12,10 @@ Planned first, executed second, so ``--dry-run`` walks the same code as a real
 run and predicts the same names - including the collision suffixes, since a
 name claimed earlier in the run counts as taken.
 
-**The naming is fixed, not a matter of taste.** The existing library was built
-by ``absmove``, whose sanitiser replaced every illegal character with ``_``
-(``Space: 1969`` is on disk as ``Space_ 1969``).  Anything that normalises
-differently files the same author or series under a second folder and splits
-books Audiobookshelf currently shows as one.  :func:`library_component` is
-therefore a deliberate duplicate of ``paths.sanitize_filename`` rather than a
-call to it; the two namespaces have different histories and must keep them.
+:mod:`forge.naming` owns the names themselves: the two templates, their
+validation, and the ``_`` substitution that matches how ``absmove`` built the
+library this one inherited.  Shelving checks both templates before it looks at
+a single book.
 """
 
 from __future__ import annotations
@@ -31,13 +29,27 @@ from typing import Callable, Iterable, Sequence
 
 from . import authors as authors_mod
 from . import library as library_mod
+from . import naming
 from . import tags as tags_mod
 from . import titles as titles_mod
 from .archive import move_into_library
 from .config import Config
 from .errors import ForgeError
 from .history import History
-from .paths import INVALID_CHARS, WINDOWS_RESERVED, collision_safe_path
+# Re-exported: :mod:`forge.naming` owns every rule about how a book is named,
+# but callers have always reached for these through this module.
+from .naming import (
+    AKA_RE,
+    AUTHOR_ROLE_SUFFIXES,
+    BARE_ROLE_RE,
+    MAX_LIBRARY_COMPONENT,
+    ROLE_SUFFIX_RE,
+    clean_author,
+    format_series_part,
+    is_role_credit,
+    library_component,
+)
+from .paths import collision_safe_path
 from .scan import Book, book_key, is_in_progress
 
 LOGGER = logging.getLogger(__name__)
@@ -45,39 +57,6 @@ LOGGER = logging.getLogger(__name__)
 #: Only finished books are shelved.  A folder of loose tracks is a conversion
 #: input, not a library item.
 SHELVEABLE_EXTENSIONS = (".m4b",)
-
-_INVALID_RE = re.compile(f"[{re.escape(INVALID_CHARS)}\x01-\x1f]")
-
-#: The real filesystem limit on one path component, not forge's narrower
-#: budget for conversion outputs: the library already holds a 207-byte author
-#: folder (a fourteen-author anthology), and capping shorter would file its
-#: next book under a new, truncated name.
-MAX_LIBRARY_COMPONENT = 255
-
-#: Room for the " (2)" … " (999)" a collision adds to a filename.
-_COLLISION_ALLOWANCE = 6
-
-#: Credits Audible attaches to contributors who are not the book's author.
-#: An explicit list rather than "drop anything after a dash", so a hyphenated
-#: surname that arrives with stray spaces ("Mary Smith - Jones") survives.
-AUTHOR_ROLE_SUFFIXES = (
-    "editor",
-    "translator",
-    "narrator",
-    "foreword",
-    "introduction",
-    "contributor",
-    "illustrator",
-)
-_ROLE = r"(?:" + "|".join(AUTHOR_ROLE_SUFFIXES) + r")s?"
-# One credit may stack roles: "- Translator and Editor", "- Translator/Editor".
-_ROLE_LIST = rf"{_ROLE}(?:\s*(?:,|/|&|\band\b)\s*{_ROLE})*"
-ROLE_SUFFIX_RE = re.compile(rf"\s+-\s+{_ROLE_LIST}[.\s]*$", re.IGNORECASE)
-# A comma-separated credit ("Julia Fouche - Translator, Editor") leaves an entry
-# that is nothing but a role word, which is not an author either.
-BARE_ROLE_RE = re.compile(rf"^{_ROLE_LIST}[.\s]*$", re.IGNORECASE)
-# "Tom Clancy aka Jim Jones" is one tag entry naming two authors.
-AKA_RE = re.compile(r"\s+(?:aka|a\.k\.a\.)\s+", re.IGNORECASE)
 
 
 class ShelveStatus(Enum):
@@ -169,140 +148,37 @@ class ShelveResult:
 # --------------------------------------------------------------------------- #
 
 
-def library_component(value: str | None, *, budget: int = MAX_LIBRARY_COMPONENT) -> str:
-    """Make one path component safe, the way the existing library was built.
-
-    Illegal characters become ``_`` - not a space, and runs are not collapsed.
-    See the module docstring: this is matched to what is already on disk.
-    """
-
-    name = _INVALID_RE.sub("_", str(value or ""))
-    name = name.strip().rstrip(". ")
-    if not name:
-        name = "_"
-    if name.upper() in WINDOWS_RESERVED:
-        name = f"_{name}"
-    # absmove had no length budget, so a 300-character subtitle produced a
-    # name no filesystem would accept and the move failed outright.  Capping
-    # at the filesystem's own limit changes nothing for a name that is already
-    # writable, which is every name currently in the library.
-    if len(name.encode("utf-8")) > budget:
-        name = _truncate_bytes(name, budget).rstrip(". ") or "_"
-    return name
-
-
-def _truncate_bytes(text: str, limit: int) -> str:
-    """Cut *text* to *limit* bytes without splitting a character."""
-
-    encoded = text.encode("utf-8")[:limit]
-    return encoded.decode("utf-8", errors="ignore")
-
-
-def format_series_part(value: object) -> str:
-    """Zero-pad a series part to two digits so folders sort correctly."""
-
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    try:
-        return f"{int(text):02d}"
-    except ValueError:
-        # "1.5", "Prequel" - left alone rather than mangled.
-        return text
-
-
-def is_role_credit(name: str) -> bool:
-    """True when a contributor name is a credit rather than an author.
-
-    "Basil Creighton - Translator", "David Chadwick - editor", or the bare
-    word "translator" left behind by a comma-separated credit.
-    """
-
-    entry = name.strip()
-    return bool(ROLE_SUFFIX_RE.search(entry) or BARE_ROLE_RE.match(entry))
-
-
-def clean_author(value: str | None) -> str:
-    """Drop role-credited contributors and split "X aka Y" into both authors.
-
-    Returns the original value when cleaning would leave nothing at all, so a
-    book credited only to its editor still reports an author rather than none.
-    """
-
-    if not value or not value.strip():
-        return value or ""
-
-    authors: list[str] = []
-    for entry in value.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if is_role_credit(entry):
-            continue
-        for name in AKA_RE.split(entry):
-            name = name.strip()
-            if name and name not in authors:
-                authors.append(name)
-
-    return ", ".join(authors) if authors else value
-
-
-def _year_of(meta: tags_mod.BookMetadata) -> str:
-    if meta.published_year:
-        return str(meta.published_year)
-    match = re.match(r"(\d{4})", str(meta.published_date or ""))
-    return match.group(1) if match else ""
-
-
 def library_path(
     root: Path,
     meta: tags_mod.BookMetadata,
     *,
+    templates: naming.Templates,
     suffix: str = ".m4b",
     registry: "authors_mod.AuthorRegistry | None" = None,
     phrases: Sequence[str] = (),
 ) -> Path:
-    """Where *meta* belongs under *root*.
+    """Where *meta* belongs under *root*, per *templates*.
 
+    The stock templates reproduce the layout the library was built with:
     ``Author/Series/NN - Album/Album (year) [asin].m4b``, with the series
-    folder, the part prefix, the year and the ASIN each dropped when absent.
+    folder, the part prefix, the year and the ASIN each dropped when the tag
+    behind it is absent.  *templates* is required rather than defaulted, so a
+    caller cannot quietly ignore what the user configured.
+
+    Raises :class:`forge.naming.EmptyName` when this particular book has none
+    of the tags the templates ask for; callers turn that into a skip, since the
+    fix is to edit the tags rather than the config.
     """
 
-    author = clean_author(meta.author or meta.albumartist)
-    if registry is not None:
-        author = registry.resolve(author).canonical or author
-    # The folder lists collaborators alphabetically; the tag keeps the order it
-    # was billed in.  Audible gives the same pair in a different order from one
-    # book to the next, which without this makes a second shelf for the same
-    # two people.  Only the name computed here is ordered: an existing folder
-    # naming the same people wins, whatever order it used, so nothing already
-    # shelved is renamed for the sake of it.
-    author = authors_mod.join_authors(
-        authors_mod.folder_order(authors_mod.split_authors(author))
+    return naming.shelf_path(
+        root,
+        meta,
+        shelf_template=templates.shelf,
+        filename_template=templates.filename,
+        suffix=suffix,
+        registry=registry,
+        phrases=phrases,
     )
-    # The folder is named from the same cleaned-up title that goes into the
-    # tag, or the shelf would still advertise "A LitRPG Adventure".
-    album = (titles_mod.strip_phrases(meta.album or meta.title, phrases) or "").strip()
-    series = (meta.series or "").strip()
-    part = format_series_part(meta.series_sequence)
-    year = _year_of(meta)
-    asin = (meta.asin or "").strip()
-
-    parts = [library_component(author)]
-    if series:
-        parts.append(library_component(series))
-    parts.append(library_component(f"{part} - {album}" if part else album))
-
-    filename = album
-    if year:
-        filename += f" ({year})"
-    if asin:
-        filename += f" [{asin}]"
-
-    # The filename gets a smaller budget than a folder: the suffix and a
-    # possible collision marker have to fit inside the same limit.
-    budget = MAX_LIBRARY_COMPONENT - len(suffix.encode("utf-8")) - _COLLISION_ALLOWANCE
-    return root.joinpath(*parts, library_component(filename, budget=budget) + suffix)
 
 
 # --------------------------------------------------------------------------- #
@@ -576,6 +452,10 @@ def plan_book(
     if cfg.library_dir is None:
         raise ForgeError("no library directory configured")
 
+    # Before the tags are even read: a template that cannot produce a legal
+    # name is the user's to fix, and saying so per book would bury it.
+    templates = naming.require(cfg)
+
     key = book_key(path)
     try:
         meta = tags_mod.read_metadata(path)
@@ -585,9 +465,7 @@ def plan_book(
             reason=f"tags could not be read: {exc}", category="unreadable tags",
         )
 
-    author = clean_author(meta.author or meta.albumartist)
-    if registry is not None:
-        author = registry.resolve(author).canonical or author
+    author = naming.canonical_author(meta, registry=registry)
     if not author.strip():
         return ShelvePlan(
             source=path, status=ShelveStatus.SKIPPED, book_key=key,
@@ -621,18 +499,23 @@ def plan_book(
                 duplicate_of=match,
             )
 
-    target = collision_safe_path(
-        match_existing_case(
+    try:
+        destination = library_path(
             cfg.library_dir,
-            library_path(
-                cfg.library_dir,
-                meta,
-                suffix=path.suffix.casefold(),
-                registry=registry,
-                phrases=phrases,
-            ),
+            meta,
+            templates=templates,
+            suffix=path.suffix.casefold(),
             registry=registry,
-        ),
+            phrases=phrases,
+        )
+    except naming.EmptyName as exc:
+        return ShelvePlan(
+            source=path, status=ShelveStatus.SKIPPED, book_key=key,
+            reason=str(exc), category="no name from the template",
+        )
+
+    target = collision_safe_path(
+        match_existing_case(cfg.library_dir, destination, registry=registry),
         reserved=reserved,
     )
     return ShelvePlan(
@@ -654,6 +537,7 @@ def plan_many(
 ) -> list[ShelvePlan]:
     """Plan a whole batch, so two books cannot be sent to the same name."""
 
+    naming.require(cfg)
     reserved: set[Path] = set()
     plans: list[ShelvePlan] = []
     for path in paths:

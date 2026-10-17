@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
 from . import authors as authors_mod
+from . import naming
 from . import tags as tags_mod
 from .archive import move_into_library
 from .config import Config
@@ -353,6 +354,7 @@ def plan_book(
     """Where this book belongs now, and what its tags should say."""
 
     assert cfg.library_dir is not None
+    templates = naming.require(cfg)
     meta = tags_mod.read_metadata(book.path)
     fixes = tag_fixes_for(meta, registry=registry)
 
@@ -361,6 +363,19 @@ def plan_book(
     patched = replace(meta, **{
         name: value for name, value in fixes.items() if name in _METADATA_FIELDS
     }) if fixes else meta
+    try:
+        wanted_path = library_path(
+            cfg.library_dir,
+            patched,
+            templates=templates,
+            suffix=book.path.suffix.casefold(),
+        )
+    except naming.EmptyName as exc:
+        # Left exactly where it is.  A book already in the library whose tags
+        # say nothing the template asks for has no better place to be, and
+        # moving it to a guessed name would lose it.
+        return BackfillAction(source=book.path, target=book.path, reasons=(str(exc),))
+
     # fold_author_case is off at the author level only: this pass exists to
     # rename author folders, so one differing by case must not keep hold of the
     # books - the old one is emptied and pruned in the same run.  Deeper levels
@@ -369,7 +384,7 @@ def plan_book(
     # what merges "Earth's First StarFighter" with "Earth's First Starfighter".
     ideal = match_existing_case(
         cfg.library_dir,
-        library_path(cfg.library_dir, patched, suffix=book.path.suffix.casefold()),
+        wanted_path,
         fold_author_case=False,
         registry=registry,
     )

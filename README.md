@@ -63,6 +63,7 @@ forge run [PATHS...]         the executor. No paths means everything tagged.
   -d, --disposition LIST     restrict to given dispositions
   --limit N                  stop after N books
 forge list                   show the books in the source directory
+forge naming [PATH]          the filename templates, their tags, and an example
 forge tags show|set PATHS    non-interactive tag inspection and editing
 forge disposition PATHS      read, or set with -s
 forge lookup TITLE|--asin    query Audible; --apply FILE writes the result
@@ -481,7 +482,7 @@ locked, `130` interrupted.
 ### Shelving: into the Audiobookshelf library
 
 The last step. `forge shelve` reads the output directory and files each
-finished book where Audiobookshelf expects it:
+finished book where Audiobookshelf expects it — by default:
 
 ```
 <library>/<Author>/<Series>/<NN - Album>/<Album (year) [asin]>.m4b
@@ -521,6 +522,43 @@ The series part is zero-padded (`3` → `03`) so folders sort, and an illegal
 character in a name becomes `_` (`Space: 1969` → `Space_ 1969`). That is not a
 style choice: it is what is already on disk, and normalising differently would
 file the same author under a second folder.
+
+### Naming
+
+The layout above is two settings, not a rule baked into the code:
+
+```ini
+[naming]
+shelf_template    = <author>/<series>/<series_part> - <album>
+filename_template = <album> (<year>) [<asin>]
+```
+
+Literal text is used as written, `<tag>` is replaced with the book's tag value,
+and in `shelf_template` a `/` separates directories. The available tags are
+`<author>`, `<album>`, `<title>`, `<subtitle>`, `<series>`, `<series_part>`,
+`<narrator>`, `<asin>`, `<year>`, `<publisher>`, `<language>` and `<genre>`;
+`config.sample.ini` lists them with examples, and `forge naming` prints them
+with whatever the current templates would produce — give it a file and it
+names that book instead of the example.
+
+`forge run` uses `filename_template` too, so a conversion output already has
+the name it will keep in the library. It used to have its own convention,
+`Author - Title.m4b`, which carried no series, year or ASIN and collided
+whenever an author reused a title across two series.
+
+Optional parts look after themselves, since most books have no series and
+plenty have no ASIN: a bracketed run whose tags are all empty is dropped with
+its brackets (`(<year>)` leaves nothing, not `()`), punctuation next to an
+empty tag goes with it (`<series_part> - <album>` is just the album for a
+standalone), and a `shelf_template` directory that comes out empty is skipped.
+
+Both templates are parsed before `forge run` or `forge shelve` looks at a
+single book, and a bad one is fatal: an illegal character in the literal text,
+an unknown tag, an unclosed `<`, or a template that could only ever render
+empty stops forge with the setting named and nothing moved. Nothing is
+silently corrected, because a sanitised surprise leaves a library to clean up
+by hand. Characters arriving in the *tag values* are the separate, documented
+case above — they become `_`, as they always have.
 
 `library_dir` is optional and forge never creates it — a typo should fail
 loudly rather than quietly start filling a second library beside the real one.
@@ -615,10 +653,14 @@ forge/
   disposition.py  the tag and its meaning  rules.py     the encoding decisions
   scan.py         book discovery           plan.py      source + intent → a plan
   convert.py      the executor             validate.py  output verification
-  archive.py      promote, archive, move   paths.py     filename construction
+  archive.py      promote, archive, move   paths.py     character rules, collisions
+  naming.py       templates, sanitising, every name forge writes
   tags.py         mutagen read/write       audible.py   catalogue lookup
+  authors.py      author identities        titles.py    marketing-phrase stripping
   history.py      change log and undo      settle.py    wait for files to stop changing
   control.py      interruption handling    lock.py      single-instance lock
   render.py       terminal output          library.py   Audiobookshelf, read-only
-  shelve.py       into the library         tui/         the triage interface
+  sorting.py      list orders              errors.py    the exception hierarchy
+  shelve.py       into the library         backfill.py  re-file the existing library
+  tui/            the triage interface
 ```
