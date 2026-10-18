@@ -33,7 +33,7 @@ class EditNameScreen(ModalScreen[str | None]):
     CSS = """
     EditNameScreen { align: center middle; }
     #box {
-        width: 84; height: auto; max-height: 90%;
+        width: 84; max-width: 100%; height: auto; max-height: 90%;
         border: round $accent; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; margin-bottom: 1; }
@@ -44,6 +44,9 @@ class EditNameScreen(ModalScreen[str | None]):
     .choice { height: 1; }
     #row { height: 3; }
     #label { width: 12; padding-top: 1; color: $text-muted; }
+    /* textual's Input is `width: 100%`, so beside a fixed-width label it
+       overflows the row by the label's width; 1fr takes what is left. */
+    #row Input { width: 1fr; }
     #buttons { height: auto; margin-top: 1; }
     #error { color: $error; height: auto; }
     #hint { color: $text-muted; margin-top: 1; }
@@ -153,7 +156,7 @@ class UnsavedChangesScreen(ModalScreen[str | None]):
     CSS = """
     UnsavedChangesScreen { align: center middle; }
     #box {
-        width: 76; height: auto;
+        width: 76; max-width: 100%; height: auto;
         border: round $warning; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; margin-bottom: 1; }
@@ -200,7 +203,7 @@ class AuthorSortScreen(ModalScreen[tuple[str, bool] | None]):
     CSS = """
     AuthorSortScreen { align: center middle; }
     #box {
-        width: 72; height: auto; max-height: 90%;
+        width: 72; max-width: 100%; height: auto; max-height: 90%;
         border: round $accent; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; margin-bottom: 1; }

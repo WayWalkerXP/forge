@@ -26,12 +26,15 @@ class EditPhraseScreen(ModalScreen[str | None]):
     CSS = """
     EditPhraseScreen { align: center middle; }
     #box {
-        width: 88; height: auto;
+        width: 88; max-width: 100%; height: auto;
         border: round $accent; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; margin-bottom: 1; }
     #row { height: 3; }
     #label { width: 10; padding-top: 1; color: $text-muted; }
+    /* textual's Input is `width: 100%`, so beside a fixed-width label it
+       overflows the row by the label's width; 1fr takes what is left. */
+    #row Input { width: 1fr; }
     #preview { height: auto; margin-top: 1; }
     #error { color: $error; height: auto; }
     #buttons { height: auto; margin-top: 1; }
@@ -125,12 +128,15 @@ class TestTitleScreen(ModalScreen[None]):
     CSS = """
     TestTitleScreen { align: center middle; }
     #box {
-        width: 92; height: auto;
+        width: 92; max-width: 100%; height: auto;
         border: round $accent; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; margin-bottom: 1; }
     #row { height: 3; }
     #label { width: 8; padding-top: 1; color: $text-muted; }
+    /* textual's Input is `width: 100%`, so beside a fixed-width label it
+       overflows the row by the label's width; 1fr takes what is left. */
+    #row Input { width: 1fr; }
     #result { height: auto; margin-top: 1; }
     #hint { color: $text-muted; margin-top: 1; }
     """

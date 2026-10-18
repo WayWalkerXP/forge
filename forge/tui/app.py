@@ -16,7 +16,7 @@ import logging
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -47,6 +47,8 @@ from .screens import (
     DuplicateScreen,
     MetadataScreen,
     SortScreen,
+    TrackChoice,
+    TrackScreen,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -537,6 +539,7 @@ class TriageApp(App[int]):
             table = self.query_one("#books", DataTable)
         except NoMatches:
             return
+
         previous = table.cursor_row
         table.clear()
         # Rebuilt from the registry each time, so an identity learned since the
@@ -1069,12 +1072,108 @@ class TriageApp(App[int]):
             )
             return
 
+        # A folder book is asked about first: which track, or the book itself.
+        # One file in a folder has nothing to choose between, so it goes
+        # straight to the fields like a single-file book does.
+        if book.is_folder and len(book.files) > 1:
+            self._pick_track(book)
+            return
+
+        self._edit_metadata(book, book.metadata)
+
+    @work(thread=True, group="track-tags", exit_on_error=False)
+    def _pick_track(self, book: Book) -> None:
+        """Read every track's tags, then offer the picker.
+
+        Here rather than in the screen, because screens do no file I/O: a
+        300-track book is 300 tag reads, which belongs on a worker with the
+        activity indicator running.  A track whose tags cannot be read is kept
+        in the list with its own note rather than hidden - it is probably the
+        one the user came to look at.
+        """
+
+        tracks: list[tuple[Path, tags_mod.BookMetadata | None]] = []
+        try:
+            with self.activity("Reading track tags"):
+                for path in book.files:
+                    try:
+                        tracks.append((path, tags_mod.read_metadata(path)))
+                    except Exception as exc:
+                        LOGGER.warning("could not read tags from %s: %s", path, exc)
+                        tracks.append((path, None))
+        except Exception as exc:
+            # Deliberately broad: an exception escaping a worker takes the
+            # whole interface down with textual's default exit_on_error.
+            LOGGER.exception("could not list the tracks of %s", book.path)
+            self.app.call_from_thread(
+                self._status,
+                f"[red]could not read {escape(book.display_name)}: {escape(str(exc))}[/red]",
+            )
+            return
+
+        self.app.call_from_thread(self._show_track_picker, book, tracks)
+
+    def _show_track_picker(
+        self, book: Book, tracks: list[tuple[Path, tags_mod.BookMetadata | None]]
+    ) -> None:
+        def chosen(choice: TrackChoice | None) -> None:
+            if choice is None:
+                return
+            if choice.file is None:
+                self._edit_metadata(
+                    book,
+                    book.metadata,
+                    fields=tags_mod.BOOK_LEVEL_EDITABLE_FIELDS,
+                    note=f"applies to all {len(book.files)} tracks",
+                )
+                return
+            if choice.metadata is None:
+                self._status(
+                    f"[yellow]{escape(choice.file.name)}: tags could not be read, so "
+                    f"there is nothing to edit[/yellow]"
+                )
+                return
+            self._edit_metadata(
+                book,
+                choice.metadata,
+                name_hint=f"{book.display_name} / {choice.file.name}",
+                note="this track only",
+                only=choice.file,
+            )
+
+        self.push_screen(TrackScreen(book.display_name, tracks), chosen)
+
+    def _edit_metadata(
+        self,
+        book: Book,
+        metadata: tags_mod.BookMetadata | None,
+        *,
+        fields: Sequence[tuple[str, str]] = tags_mod.EDITABLE_FIELDS,
+        name_hint: str | None = None,
+        note: str = "",
+        only: Path | None = None,
+    ) -> None:
+        """Open the field editor and write what comes back.
+
+        *only* names the one file to write to, for a track edit; without it a
+        folder book's edit spreads across its tracks as it always has.
+        """
+
+        if metadata is None:  # pragma: no cover - the callers check this
+            return
+
         def apply(updates: dict | None) -> None:
             if updates:
-                self._write_tags(book, updates, source="manual")
+                self._write_tags(book, updates, source="manual", only=only)
 
         self.push_screen(
-            MetadataScreen(book.metadata, name_hint=book.display_name), apply
+            MetadataScreen(
+                metadata,
+                name_hint=name_hint or book.display_name,
+                fields=fields,
+                note=note,
+            ),
+            apply,
         )
 
     def action_audible(self) -> None:
@@ -1127,13 +1226,26 @@ class TriageApp(App[int]):
 
     @work(thread=True, group="tag-write", exit_on_error=False)
     def _write_tags(
-        self, book: Book, updates: dict, *, source: str, description: str | None = None
+        self,
+        book: Book,
+        updates: dict,
+        *,
+        source: str,
+        description: str | None = None,
+        only: Path | None = None,
     ) -> None:
-        """Write tags to every file of a book, recording what changed."""
+        """Write tags to every file of a book, recording what changed.
+
+        With *only*, exactly one track is written and every field goes to it:
+        the book-level filter below exists to spread a book's tags across its
+        tracks, which is the opposite of what a track edit asked for.
+        """
 
         targets = book.files if book.is_folder else book.files[:1]
         per_file = updates
-        if book.is_folder:
+        if only is not None:
+            targets = [only]
+        elif book.is_folder:
             # Title, track and disc belong to a track; everything else is a
             # property of the book and applies to all of them.
             per_file = {

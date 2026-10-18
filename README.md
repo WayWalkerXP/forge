@@ -116,7 +116,7 @@ database stores a hash and a size, not the image.
 | `m` | mark the selected book and move down |
 | `M` | mark every book the filter is showing, or unmark them |
 | `U` | clear every mark |
-| `e` | edit tags |
+| `e` | edit tags (a folder book asks which track first) |
 | `a` | Audible lookup |
 | `d` | check this book against the Audiobookshelf library |
 | `D` | check every book that has an ASIN |
@@ -138,6 +138,23 @@ a dim `[Idle]` when nothing is running, and an accented `[⠙ Scanning directory
 work is in flight. The spinner animates, which is the part that distinguishes
 slow work from a wedged interface — scanning a large directory and writing tags
 into a multi-gigabyte container both take long enough to look like a hang.
+
+### Editing a folder book's tags
+
+A folder book is one book made of many files, and its tags live at two levels:
+the ones every track shares — author, album, series, ASIN — and the ones that
+belong to the track, which is title, track number and disc.
+
+`e` on a folder book therefore asks what the edit applies to. The table lists
+the tracks with their track number and title; `enter` edits the one under the
+cursor and writes to that file alone. `b`, or the button, edits the book as a
+whole: those fields are written to every track, and the per-track ones are not
+offered at all, because a title written to twelve files turns twelve chapters
+into twelve copies of "Chapter 1". A track whose tags cannot be read stays in
+the list, labelled, since it is usually the one worth looking at.
+
+Reading a long book's tracks takes a moment, so it happens on a worker with the
+activity indicator running rather than freezing the interface.
 
 ### Setting a disposition on several books at once
 

@@ -405,6 +405,15 @@ BOOK_LEVEL_FIELDS = frozenset(
     }
 )
 
+#: The editable fields that belong to the book, in the same order.  Editing a
+#: folder book as a whole offers these and not the per-track ones: a title
+#: written to every file would turn twelve chapters into twelve copies of
+#: "Chapter 1".  The track-level fields are edited one track at a time.
+BOOK_LEVEL_EDITABLE_FIELDS: tuple[tuple[str, str], ...] = tuple(
+    (field, label) for field, label in EDITABLE_FIELDS if field in BOOK_LEVEL_FIELDS
+)
+
+
 # MP4 atoms for fields with a dedicated atom.  Everything else goes to a
 # ``----:com.apple.iTunes:`` freeform via the explicit list below, so a typo'd
 # field name raises instead of silently creating a junk atom.

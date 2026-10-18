@@ -9,6 +9,7 @@ These tests assert the two properties that matter most about triage:
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tests.helpers import TempCaseMixin, copy_mp3, requires_ffmpeg, write_config
@@ -1016,7 +1017,9 @@ class ScreenConstruction(unittest.TestCase):
         )
 
     def test_every_screen_constructs(self) -> None:
-        from forge.tags import BookMetadata
+        from pathlib import Path
+
+        from forge.tags import BOOK_LEVEL_EDITABLE_FIELDS, BookMetadata
         from forge.tui.author_screens import (
             AuthorSortScreen,
             EditNameScreen,
@@ -1030,6 +1033,7 @@ class ScreenConstruction(unittest.TestCase):
             DispositionScreen,
             MetadataScreen,
             SortScreen,
+            TrackScreen,
         )
 
         book = self._book()
@@ -1039,6 +1043,15 @@ class ScreenConstruction(unittest.TestCase):
             ("DispositionScreen", lambda: DispositionScreen(book)),
             ("DispositionScreen(batch)", lambda: DispositionScreen(book, [book, book])),
             ("MetadataScreen", lambda: MetadataScreen(metadata, name_hint="a.m4b")),
+            ("MetadataScreen(book-level)",
+             lambda: MetadataScreen(
+                 metadata, name_hint="a", fields=BOOK_LEVEL_EDITABLE_FIELDS,
+                 note="applies to all 3 tracks",
+             )),
+            ("TrackScreen",
+             lambda: TrackScreen("A Book", [(Path("/books/01.mp3"), metadata)])),
+            ("TrackScreen(unreadable)",
+             lambda: TrackScreen("A Book", [(Path("/books/01.mp3"), None)])),
             ("AudibleScreen", lambda: AudibleScreen(book)),
             ("AudibleScreen(region)", lambda: AudibleScreen(book, region="uk")),
             ("CompareScreen", lambda: CompareScreen(metadata, {"author": "X"}, name_hint="a")),
@@ -1764,6 +1777,114 @@ class ScreenLayout(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
             screen = await self.open_audible(pilot, pilot.app)
             self.assertLessEqual(screen.query_one("#query").size.height, 12)
 
+    async def test_every_input_stays_inside_its_dialog(self) -> None:
+        """A fixed-width label beside an Input must not overflow the row.
+
+        textual's Input is ``width: 100%``, so in a Horizontal with an
+        18-column label it claimed the whole row and hung those 18 columns over
+        the edge.  In the metadata editor - the only one of these whose fields
+        sit in a VerticalScroll - focusing a field then scrolled the list
+        *sideways* to bring the overflow into view, which dragged the labels
+        out from under the dialog and left text stranded to the left of it.
+        """
+
+        from pathlib import Path
+
+        from textual.widgets import Input
+
+        from forge.tags import BookMetadata
+        from forge.tui.author_screens import EditNameScreen
+        from forge.tui.title_screens import EditPhraseScreen, TestTitleScreen
+        from forge.tui.screens import MetadataScreen, TrackScreen
+
+        metadata = BookMetadata(path="/books/a.m4b", author="An Author")
+
+        async with self.app().run_test(size=(120, 32)) as pilot:
+            app = pilot.app
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            for label, build in (
+                ("MetadataScreen", lambda: MetadataScreen(metadata, name_hint="a.m4b")),
+                ("EditNameScreen", lambda: EditNameScreen("B0", "A Name")),
+                ("EditPhraseScreen", lambda: EditPhraseScreen("A LitRPG Adventure")),
+                ("TestTitleScreen", lambda: TestTitleScreen(["A LitRPG Adventure"])),
+                ("TrackScreen",
+                 lambda: TrackScreen("A Book", [(Path("/books/01.mp3"), metadata)])),
+            ):
+                app.push_screen(build())
+                await pilot.pause(0.2)
+                screen = app.screen
+                box = screen.query_one("#box")
+                content = box.content_region
+                for widget in screen.query(Input):
+                    # Sideways only: a field below the fold of a scrolling list
+                    # is legitimately outside the box, while one that is too
+                    # wide for its row is the bug.
+                    with self.subTest(screen=label, widget=widget.id):
+                        self.assertGreaterEqual(
+                            widget.region.x, content.x,
+                            f"{label} {widget.id} starts left of the dialog",
+                        )
+                        self.assertLessEqual(
+                            widget.region.right, content.right,
+                            f"{label} {widget.id} at {widget.region} is {widget.region.right - content.right} "
+                            f"column(s) wider than the dialog content area {content}",
+                        )
+                app.pop_screen()
+                await pilot.pause(0.1)
+
+    async def test_tabbing_the_metadata_fields_never_scrolls_sideways(self) -> None:
+        # The reported symptom: tab through the editor and text appears to the
+        # left of the dialog.  A horizontal scroll offset is what causes it, so
+        # it is what gets asserted, field by field.
+        from textual.widgets import Input
+
+        from forge.tags import EDITABLE_FIELDS
+
+        async with self.app().run_test(size=(120, 32)) as pilot:
+            app = pilot.app
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause(0.2)
+            screen = app.screen
+            box = screen.query_one("#box")
+            fields = screen.query_one("#fields")
+
+            for _ in range(len(EDITABLE_FIELDS)):
+                focused = app.focused
+                if isinstance(focused, Input):
+                    with self.subTest(field=focused.id):
+                        self.assertEqual(
+                            fields.scroll_offset.x, 0, "the field list scrolled sideways"
+                        )
+                        self.assertTrue(
+                            box.content_region.contains_region(focused.region),
+                            f"{focused.id} at {focused.region} is outside "
+                            f"{box.content_region}",
+                        )
+                await pilot.press("tab")
+                await pilot.pause()
+
+    async def test_a_dialog_fits_a_narrow_terminal(self) -> None:
+        # Every dialog states a fixed column width, and centring one wider than
+        # the terminal leaves its right-hand side off screen with the contents
+        # clipped.  80 columns is a perfectly ordinary terminal.
+        async with self.app().run_test(size=(80, 24)) as pilot:
+            app = pilot.app
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause(0.2)
+            box = app.screen.query_one("#box")
+            self.assertGreaterEqual(box.region.x, 0, f"the dialog starts at {box.region.x}")
+            self.assertLessEqual(
+                box.region.right, 80, f"the dialog ends at {box.region.right}"
+            )
+
     def batch_book(self):
         from pathlib import Path
 
@@ -1779,6 +1900,8 @@ class ScreenLayout(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_the_other_dialogs_fit_too(self) -> None:
+        from pathlib import Path
+
         from forge.tags import BookMetadata
         from forge.tui.author_screens import (
             AuthorSortScreen,
@@ -1792,6 +1915,7 @@ class ScreenLayout(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
             DispositionScreen,
             MetadataScreen,
             SortScreen,
+            TrackScreen,
         )
 
         metadata = BookMetadata(path="/books/a.m4b", author="An Author")
@@ -1824,6 +1948,12 @@ class ScreenLayout(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
                 ("TestTitleScreen",
                  lambda: TestTitleScreen(["A LitRPG Adventure"]),
                  ["#row", "#result", "#hint"]),
+                ("TrackScreen",
+                 lambda: TrackScreen(
+                     "A Book",
+                     [(Path(f"/books/{i:02d}.mp3"), metadata) for i in range(1, 40)],
+                 ),
+                 ["#title", "#subtitle", "#tracks", "#buttons", "#hint"]),
             ):
                 app.push_screen(build())
                 await pilot.pause(0.2)
@@ -1831,6 +1961,189 @@ class ScreenLayout(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
                     self.assert_visible(app.screen, "#box", ids)
                 app.pop_screen()
                 await pilot.pause(0.1)
+
+
+@requires_ffmpeg
+@requires_textual
+class EditingAFolderBook(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
+    """A folder book is many files, and its tags live at two levels.
+
+    Editing one used to show track 1 and write to track 1, so the only title
+    reachable from triage was the first chapter's - and a book whose fifth
+    chapter was tagged "Chapter 05 (1)" could not be fixed here at all.  Now
+    `e` asks which track, or the book as a whole, and these tests pin which
+    files each answer writes to.
+    """
+
+    TRACKS = 3
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg = config_mod.load(write_config(self.root))
+        self.folder = self.cfg.source_dir / "Odd Thomas"
+        self.files = []
+        for index in range(1, self.TRACKS + 1):
+            path = self.folder / f"0{index} - Chapter {index}.mp3"
+            copy_mp3(path, seconds=1)
+            tags.write_metadata(
+                path,
+                {"author": "Dean Koontz", "album": "Odd Thomas",
+                 "title": f"Chapter {index}", "track": index},
+            )
+            self.files.append(path)
+
+        self.single = self.cfg.source_dir / "single.mp3"
+        copy_mp3(self.single, seconds=1)
+        tags.write_metadata(self.single, {"author": "An Author", "album": "A Book"})
+
+    def app(self):
+        from forge.tui.app import TriageApp
+
+        return TriageApp(self.cfg, self.cfg.source_dir)
+
+    async def select(self, pilot, name: str):
+        from textual.widgets import DataTable
+
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        book = [b for b in pilot.app.shown if b.display_name == name][0]
+        pilot.app.query_one("#books", DataTable).move_cursor(
+            row=pilot.app.shown.index(book)
+        )
+        await pilot.pause()
+        return book
+
+    async def open_picker(self, pilot):
+        from forge.tui.screens import TrackScreen
+
+        await self.select(pilot, "Odd Thomas")
+        await pilot.press("e")
+        # The tracks' tags are read on a worker before the picker opens.
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause(0.2)
+        assert isinstance(pilot.app.screen, TrackScreen), type(pilot.app.screen).__name__
+        return pilot.app.screen
+
+    def titles(self) -> list[str | None]:
+        return [tags.read_metadata(path).title for path in self.files]
+
+    async def test_e_on_a_folder_book_lists_its_tracks(self) -> None:
+        async with self.app().run_test(size=(120, 40)) as pilot:
+            screen = await self.open_picker(pilot)
+            table = screen.query_one("#tracks")
+            self.assertEqual(table.row_count, self.TRACKS)
+
+    async def test_a_single_file_book_goes_straight_to_the_fields(self) -> None:
+        from forge.tags import EDITABLE_FIELDS
+        from forge.tui.screens import MetadataScreen
+
+        async with self.app().run_test(size=(120, 40)) as pilot:
+            await self.select(pilot, "single.mp3")
+            await pilot.press("e")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause(0.2)
+
+            self.assertIsInstance(pilot.app.screen, MetadataScreen)
+            self.assertEqual(len(pilot.app.screen.fields), len(EDITABLE_FIELDS))
+
+    async def test_choosing_a_track_writes_only_that_track(self) -> None:
+        from textual.widgets import Input
+
+        async with self.app().run_test(size=(120, 40)) as pilot:
+            screen = await self.open_picker(pilot)
+            screen.query_one("#tracks").move_cursor(row=1)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+
+            editor = pilot.app.screen
+            self.assertEqual(editor.query_one("#f-title", Input).value, "Chapter 2")
+            editor.query_one("#f-title", Input).value = "A Better Title"
+            await pilot.press("ctrl+s")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertEqual(self.titles(), ["Chapter 1", "A Better Title", "Chapter 3"])
+
+    async def test_the_whole_book_writes_every_track(self) -> None:
+        from textual.widgets import Input
+
+        async with self.app().run_test(size=(120, 40)) as pilot:
+            await self.open_picker(pilot)
+            await pilot.press("b")
+            await pilot.pause(0.2)
+
+            editor = pilot.app.screen
+            editor.query_one("#f-narrator", Input).value = "David Aaron Baker"
+            await pilot.press("ctrl+s")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            for path in self.files:
+                self.assertEqual(tags.read_metadata(path).narrator, "David Aaron Baker")
+            # And the per-track fields are untouched, which is the point of
+            # offering them separately.
+            self.assertEqual(self.titles(), ["Chapter 1", "Chapter 2", "Chapter 3"])
+
+    async def test_the_whole_book_offers_no_per_track_field(self) -> None:
+        # A title written to every file would turn three chapters into three
+        # copies of "Chapter 1", which is how this used to behave if the first
+        # track's title was edited.
+        from forge.tags import BOOK_LEVEL_EDITABLE_FIELDS
+
+        async with self.app().run_test(size=(120, 40)) as pilot:
+            await self.open_picker(pilot)
+            await pilot.press("b")
+            await pilot.pause(0.2)
+
+            editor = pilot.app.screen
+            self.assertEqual(len(editor.fields), len(BOOK_LEVEL_EDITABLE_FIELDS))
+            for field in ("title", "track", "disc"):
+                with self.subTest(field=field):
+                    self.assertEqual(len(editor.query(f"#f-{field}")), 0)
+
+    async def test_escaping_the_picker_writes_nothing(self) -> None:
+        before = {path: path.read_bytes() for path in self.files}
+
+        async with self.app().run_test(size=(120, 40)) as pilot:
+            await self.open_picker(pilot)
+            await pilot.press("escape")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertEqual(len(pilot.app.screen_stack), 1)
+
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content, path.name)
+
+    async def test_a_track_whose_tags_cannot_be_read_is_still_listed(self) -> None:
+        # Probably the very track the user came to look at, so it stays in the
+        # list with a note rather than disappearing from it.
+        from unittest import mock
+
+        from forge.errors import TagError
+
+        real = tags.read_metadata
+
+        def fail_on_second(path, *args, **kwargs):
+            if Path(path).name.startswith("02"):
+                raise TagError("deliberately broken")
+            return real(path, *args, **kwargs)
+
+        async with self.app().run_test(size=(120, 40)) as pilot:
+            with mock.patch("forge.tags.read_metadata", side_effect=fail_on_second):
+                screen = await self.open_picker(pilot)
+            self.assertEqual(screen.query_one("#tracks").row_count, self.TRACKS)
+            self.assertIsNone(screen.tracks[1][1])
+
+            screen.query_one("#tracks").move_cursor(row=1)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+
+            # Back on the list with a status line, not an editor full of blanks.
+            self.assertEqual(len(pilot.app.screen_stack), 1)
+            self.assertIn("could not be read", str(pilot.app.query_one("#status").renderable))
 
 
 @requires_ffmpeg

@@ -7,6 +7,8 @@ the "nothing happens that the user did not ask for" guarantee checkable.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 
 from textual import on, work
@@ -57,7 +59,7 @@ class DispositionScreen(ModalScreen[Disposition | None]):
     CSS = """
     DispositionScreen { align: center middle; }
     #box {
-        width: 72; height: auto; max-height: 80%;
+        width: 72; max-width: 100%; height: auto; max-height: 80%;
         border: round $accent; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; margin-bottom: 1; }
@@ -173,7 +175,7 @@ class SortScreen(ModalScreen[tuple[str, bool] | None]):
     CSS = """
     SortScreen { align: center middle; }
     #box {
-        width: 72; height: auto; max-height: 90%;
+        width: 72; max-width: 100%; height: auto; max-height: 90%;
         border: round $accent; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; margin-bottom: 1; }
@@ -269,19 +271,150 @@ class SortScreen(ModalScreen[tuple[str, bool] | None]):
         self.dismiss(None)
 
 
+@dataclass(frozen=True)
+class TrackChoice:
+    """What the track picker came back with.
+
+    *file* is None for "the book as a whole", which edits the tags every track
+    shares.  Otherwise it is the one track to edit, carrying the metadata the
+    app already read for the table, so the edit screen opens without going
+    back to disk.
+    """
+
+    file: Path | None
+    metadata: BookMetadata | None = None
+
+
+class TrackScreen(ModalScreen[TrackChoice | None]):
+    """Choose what an edit of a folder book applies to.
+
+    A folder book is one book made of many files, and its tags live at two
+    levels: the ones every track shares - author, album, series - and the ones
+    that belong to the track, which is title, track number and disc.  Editing
+    a folder book only ever showed track 1 and could only ever write to track
+    1, so a book whose fifth chapter was tagged "Chapter 05 (1)" could not be
+    corrected from triage at all.
+
+    The table is the tracks; the button, or `b`, is the book as a whole.  The
+    screen reads nothing itself: the app hands it the tags it already has, so
+    a 300-track book is read once, on a worker, with the activity indicator
+    running.
+    """
+
+    CSS = """
+    TrackScreen { align: center middle; }
+    #box {
+        width: 100; max-width: 100%; height: 85%;
+        border: round $accent; background: $surface; padding: 1 2;
+    }
+    #title { text-style: bold; }
+    #subtitle { color: $text-muted; margin-bottom: 1; }
+    #tracks { height: 1fr; min-height: 5; }
+    #buttons { height: auto; margin-top: 1; }
+    #hint { color: $text-muted; margin-top: 1; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "cancel"),
+        Binding("b", "whole_book", "edit the book"),
+    ]
+
+    def __init__(
+        self, name_hint: str, tracks: Sequence[tuple[Path, BookMetadata | None]]
+    ) -> None:
+        super().__init__()
+        self.name_hint = name_hint
+        self.tracks = list(tracks)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="box"):
+            yield Static(f"Edit — {escape(self.name_hint)}", id="title")
+            yield Static(
+                f"{len(self.tracks)} track(s); title, track number and disc "
+                f"belong to one track, everything else to the book",
+                id="subtitle",
+            )
+            table = DataTable(id="tracks", cursor_type="row", zebra_stripes=True)
+            table.add_columns("#", "track", "title", "file")
+            yield table
+            with Horizontal(id="buttons"):
+                yield Button("Edit this track", variant="primary", id="track")
+                yield Button("Edit the book (all tracks)", id="book")
+                yield Button("Cancel", id="cancel")
+            yield Static(
+                "[dim]enter edits the track under the cursor, b the book as a "
+                "whole, escape cancels[/dim]",
+                id="hint",
+            )
+
+    def on_mount(self) -> None:
+        table = self.query_one("#tracks", DataTable)
+        for index, (path, meta) in enumerate(self.tracks, 1):
+            if meta is None:
+                track = "—"
+                title = "[yellow]tags could not be read[/yellow]"
+            else:
+                track = str(meta.track) if meta.track is not None else "—"
+                # Escaped: a chapter really is tagged "Chapter 7 [Part 2]", and
+                # rich deletes an unknown tag from a cell without a word.
+                title = escape(meta.title) if meta.title else "[dim]—[/dim]"
+            table.add_row(str(index), track, title, escape(path.name), key=str(path))
+        table.focus()
+
+    def _under_cursor(self) -> TrackChoice | None:
+        table = self.query_one("#tracks", DataTable)
+        row = table.cursor_row
+        if row is None or not 0 <= row < len(self.tracks):
+            return None
+        path, meta = self.tracks[row]
+        return TrackChoice(file=path, metadata=meta)
+
+    def action_whole_book(self) -> None:
+        self.dismiss(TrackChoice(file=None))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(DataTable.RowSelected, "#tracks")
+    def _row_selected(self) -> None:
+        choice = self._under_cursor()
+        if choice is not None:
+            self.dismiss(choice)
+
+    @on(Button.Pressed, "#track")
+    def _track(self) -> None:
+        self._row_selected()
+
+    @on(Button.Pressed, "#book")
+    def _book(self) -> None:
+        self.action_whole_book()
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel_button(self) -> None:
+        self.action_cancel()
+
+
 class MetadataScreen(ModalScreen[dict | None]):
     """Edit a book's tags by hand."""
 
     CSS = """
     MetadataScreen { align: center middle; }
     #box {
-        width: 90; height: 90%;
+        width: 90; max-width: 100%; height: 90%;
         border: round $accent; background: $surface; padding: 1 2;
     }
-    #title { text-style: bold; margin-bottom: 1; }
-    #fields { height: 1fr; }
+    #title { text-style: bold; }
+    #note { margin-bottom: 1; }
+    #fields { height: 1fr; margin-top: 1; }
     .row { height: 3; }
     .fieldlabel { width: 18; padding-top: 1; color: $text-muted; }
+    /* textual's Input is `width: 100%`, which beside an 18-column label
+       overflows the row by exactly those 18 columns.  The field list is a
+       VerticalScroll, so focusing a field then scrolled it *sideways* to bring
+       the overflow into view, dragging the labels out from under the box and
+       leaving text stranded to the left of it. 1fr takes what is left of the
+       row instead. */
+    .row Input { width: 1fr; }
     #buttons { height: auto; margin-top: 1; }
     """
 
@@ -290,16 +423,31 @@ class MetadataScreen(ModalScreen[dict | None]):
         Binding("ctrl+s", "save", "save"),
     ]
 
-    def __init__(self, metadata: BookMetadata, *, name_hint: str = "") -> None:
+    def __init__(
+        self,
+        metadata: BookMetadata,
+        *,
+        name_hint: str = "",
+        fields: Sequence[tuple[str, str]] = EDITABLE_FIELDS,
+        note: str = "",
+    ) -> None:
         super().__init__()
         self.metadata = metadata
         self.name_hint = name_hint
+        #: Which fields this edit offers.  A folder book edited as a whole gets
+        #: the book-level ones only, because the rest are properties of one
+        #: track and writing them to every file is never what was meant.
+        self.fields = tuple(fields)
+        #: One line under the title saying what the edit will touch.
+        self.note = note
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
             yield Static(f"Edit metadata — {escape(self.name_hint)}", id="title")
+            if self.note:
+                yield Static(f"[dim]{escape(self.note)}[/dim]", id="note")
             with VerticalScroll(id="fields"):
-                for field, label in EDITABLE_FIELDS:
+                for field, label in self.fields:
                     with Horizontal(classes="row"):
                         yield Label(label, classes="fieldlabel")
                         yield Input(
@@ -315,7 +463,9 @@ class MetadataScreen(ModalScreen[dict | None]):
     def on_mount(self) -> None:
         # Focus the first field so the screen is usable without the mouse:
         # from here tab walks down the fields and on to the buttons.
-        first, _ = EDITABLE_FIELDS[0]
+        if not self.fields:  # pragma: no cover - the caller always passes some
+            return
+        first, _ = self.fields[0]
         self.query_one(f"#f-{first}", Input).focus()
 
     def _current(self, field: str) -> str:
@@ -330,7 +480,7 @@ class MetadataScreen(ModalScreen[dict | None]):
 
     def action_save(self) -> None:
         updates: dict[str, Any] = {}
-        for field, _ in EDITABLE_FIELDS:
+        for field, _ in self.fields:
             widget = self.query_one(f"#f-{field}", Input)
             raw = widget.value.strip()
             original = self._current(field)
@@ -366,7 +516,7 @@ class AudibleScreen(ModalScreen[AudibleMetadata | None]):
     CSS = """
     AudibleScreen { align: center middle; }
     #box {
-        width: 110; height: 85%;
+        width: 110; max-width: 100%; height: 85%;
         border: round $accent; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; }
@@ -380,6 +530,9 @@ class AudibleScreen(ModalScreen[AudibleMetadata | None]):
     #buttons { height: auto; margin-top: 1; }
     #status { height: auto; min-height: 2; }
     .qlabel { width: 8; padding-top: 1; color: $text-muted; }
+    /* textual's Input is `width: 100%`, so beside a fixed-width label it
+       overflows the row by the label's width; 1fr takes what is left. */
+    #query Input { width: 1fr; }
     """
 
     BINDINGS = [
@@ -602,7 +755,7 @@ class CompareScreen(ModalScreen[dict | None]):
     CSS = """
     CompareScreen { align: center middle; }
     #box {
-        width: 110; height: 85%;
+        width: 110; max-width: 100%; height: 85%;
         border: round $accent; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; margin-bottom: 1; }
@@ -677,7 +830,7 @@ class DuplicateScreen(ModalScreen[None]):
     CSS = """
     DuplicateScreen { align: center middle; }
     #box {
-        width: 94; height: auto; max-height: 80%;
+        width: 94; max-width: 100%; height: auto; max-height: 80%;
         border: round $warning; background: $surface; padding: 1 2;
     }
     #title { text-style: bold; margin-bottom: 1; }
@@ -736,7 +889,7 @@ class ConfirmScreen(ModalScreen[bool]):
     CSS = """
     ConfirmScreen { align: center middle; }
     #box {
-        width: 70; height: auto;
+        width: 70; max-width: 100%; height: auto;
         border: round $warning; background: $surface; padding: 1 2;
     }
     #buttons { height: auto; margin-top: 1; }
