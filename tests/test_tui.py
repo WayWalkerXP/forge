@@ -2148,6 +2148,273 @@ class EditingAFolderBook(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
 
 @requires_ffmpeg
 @requires_textual
+class ListScrolling(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
+    """The list must stay where the user put it.
+
+    ``refresh_table`` rebuilds the table after every action, and
+    ``DataTable.clear()`` rewinds the scroll to the top.  Restoring the cursor
+    with ``move_cursor`` then scrolled that row back into view *from above*,
+    which put it on the last line of the viewport: working down a long list,
+    every mark and every disposition jumped the list under the cursor by most
+    of a screen.
+
+    The second half of this is the selected row staying visible.  The detail
+    panel's height follows the selected book, so a book with an extra line of
+    notes shrinks the list above it - which could leave the bottom row
+    highlighted but scrolled off the end, under the horizontal scrollbar.
+    """
+
+    BOOKS = 40
+    SIZE = (100, 26)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg = config_mod.load(write_config(self.root))
+        for index in range(1, self.BOOKS + 1):
+            path = self.cfg.source_dir / f"book-{index:02d}.mp3"
+            copy_mp3(path, seconds=1)
+            tags.write_metadata(
+                path, {"author": "One Author", "album": f"Book {index:02d}"}
+            )
+
+    def app(self):
+        from forge.tui.app import TriageApp
+
+        return TriageApp(self.cfg, self.cfg.source_dir)
+
+    async def ready(self, pilot):
+        from textual.widgets import DataTable
+
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        table = pilot.app.query_one("#books", DataTable)
+        self.assertGreater(
+            table.max_scroll_y, 0, "the list has to be longer than the screen to test this"
+        )
+        return table
+
+    def view(self, table) -> tuple[int, int]:
+        return table.cursor_row, table.scroll_offset.y
+
+    def assert_cursor_visible(self, table) -> None:
+        first = table.scroll_offset.y
+        last = first + table.scrollable_content_region.height - 1
+        self.assertTrue(
+            first <= table.cursor_row <= last,
+            f"row {table.cursor_row} is outside the visible rows {first}-{last}",
+        )
+
+    async def park_mid_screen(self, pilot, table):
+        """Leave the cursor some way above the bottom of a scrolled list."""
+
+        table.move_cursor(row=self.BOOKS - 1)
+        await pilot.pause()
+        table.move_cursor(row=self.BOOKS - 10)
+        await pilot.pause()
+        self.assertGreater(table.scroll_offset.y, 0)
+        self.assert_cursor_visible(table)
+        return self.view(table)
+
+    async def test_a_disposition_write_leaves_the_list_where_it_was(self) -> None:
+        async with self.app().run_test(size=self.SIZE) as pilot:
+            table = await self.ready(pilot)
+            before = await self.park_mid_screen(pilot, table)
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.press("1")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertEqual(self.view(table), before)
+
+    async def test_marking_a_run_scrolls_one_row_at_a_time(self) -> None:
+        # The symptom that made marking cumbersome: `m` advances by one row,
+        # so the list should move by at most that - not by a screenful.
+        async with self.app().run_test(size=self.SIZE) as pilot:
+            table = await self.ready(pilot)
+            start_row, start_offset = await self.park_mid_screen(pilot, table)
+
+            offsets = []
+            for _ in range(6):
+                await pilot.press("m")
+                await pilot.app.workers.wait_for_complete()
+                await pilot.pause()
+                offsets.append(table.scroll_offset.y)
+                self.assert_cursor_visible(table)
+
+            self.assertEqual(table.cursor_row, start_row + 6)
+            for step, offset in enumerate(offsets):
+                with self.subTest(step=step):
+                    self.assertLessEqual(
+                        abs(offset - start_offset), step + 1,
+                        f"the list jumped from {start_offset} to {offset}",
+                    )
+            self.assertEqual(len(pilot.app.marked), 6)
+
+    async def test_clearing_the_marks_leaves_the_list_where_it_was(self) -> None:
+        async with self.app().run_test(size=self.SIZE) as pilot:
+            table = await self.ready(pilot)
+            await self.park_mid_screen(pilot, table)
+            await pilot.press("m")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            before = self.view(table)
+
+            await pilot.press("U")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertEqual(self.view(table), before)
+
+    async def test_the_selected_row_survives_the_detail_panel_growing(self) -> None:
+        # A disposition adds an encoding line to the panel, which shrinks the
+        # list above it.  With the cursor on the last row there is nowhere for
+        # that row to go but off the bottom.
+        async with self.app().run_test(size=self.SIZE) as pilot:
+            table = await self.ready(pilot)
+            table.move_cursor(row=self.BOOKS - 1)
+            await pilot.pause()
+            self.assert_cursor_visible(table)
+            height_before = table.scrollable_content_region.height
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.press("1")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertLessEqual(
+                table.scrollable_content_region.height, height_before,
+                "this test is only meaningful while the panel can grow",
+            )
+            self.assertEqual(table.cursor_row, self.BOOKS - 1)
+            self.assert_cursor_visible(table)
+
+    async def test_the_cursor_stays_visible_when_a_filter_shortens_the_list(self) -> None:
+        async with self.app().run_test(size=self.SIZE) as pilot:
+            table = await self.ready(pilot)
+            table.move_cursor(row=self.BOOKS - 1)
+            await pilot.pause()
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.press("1")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            # untriaged: one book fewer than the list the cursor sits in.
+            await pilot.press("f")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertEqual(len(pilot.app.shown), self.BOOKS - 1)
+            self.assertLess(table.cursor_row, len(pilot.app.shown))
+            self.assert_cursor_visible(table)
+
+    async def test_the_selected_row_survives_the_terminal_shrinking(self) -> None:
+        # Nothing moves the cursor here, so textual has no reason to scroll it
+        # back into view: the viewport simply gets shorter underneath it.
+        async with self.app().run_test(size=self.SIZE) as pilot:
+            table = await self.ready(pilot)
+            table.move_cursor(row=self.BOOKS - 1)
+            await pilot.pause()
+            self.assert_cursor_visible(table)
+
+            await pilot.resize_terminal(self.SIZE[0], 18)
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertEqual(table.cursor_row, self.BOOKS - 1)
+            self.assert_cursor_visible(table)
+
+            await pilot.resize_terminal(70, 14)
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assert_cursor_visible(table)
+
+    async def test_the_last_row_is_not_left_behind_the_scrollbar(self) -> None:
+        """A row on screen has to be a row the user can see.
+
+        At a width where the columns overflow, the table draws a horizontal
+        scrollbar over the last line of its own scrollable region, and the
+        header sits inside that region too.  Counting either as space for a row
+        made the bottom book look visible while it was behind the scrollbar:
+        highlighted, acted on by the next keystroke, and never seen.
+
+        Asserted against a screenshot rather than against the geometry, since
+        the geometry is exactly what was being read wrongly.
+        """
+
+        # Narrow enough that the columns do not fit, and short enough that one
+        # row does not: 80 columns is an ordinary terminal.
+        async with self.app().run_test(size=(80, 22)) as pilot:
+            table = await self.ready(pilot)
+            self.assertTrue(
+                table.show_horizontal_scrollbar,
+                "this test needs the horizontal scrollbar that causes the bug",
+            )
+
+            table.move_cursor(row=self.BOOKS - 1)
+            await pilot.pause()
+            name = pilot.app.shown[table.cursor_row].title
+            assert name
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.press("1")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertEqual(table.cursor_row, self.BOOKS - 1)
+            screen = pilot.app.export_screenshot()
+            self.assertTrue(
+                name in screen or name.replace(" ", "&#160;") in screen,
+                f"{name} is selected but not on screen",
+            )
+
+    def test_the_book_table_shadows_nothing_of_textuals(self) -> None:
+        # The silent-failure class this app has been bitten by: a method or
+        # attribute that happens to exist on the base class breaks layout with
+        # an error naming neither the widget nor the name.
+        from textual.widgets import DataTable
+
+        from forge.tui.app import BookTable
+
+        import inspect
+
+        # Only what the class body defines: textual's metaclass injects
+        # inherited settings like `can_focus_children` into every subclass.
+        mine = {
+            name
+            for name, value in vars(BookTable).items()
+            if inspect.isfunction(value) and not name.startswith("__")
+        }
+        self.assertIn("keep_cursor_visible", mine, "the helper should be here")
+        for name in sorted(mine):
+            with self.subTest(name=name):
+                base = getattr(DataTable, name, None)
+                self.assertTrue(
+                    base is None or name.startswith("on_"),
+                    f"BookTable.{name} shadows DataTable.{name}",
+                )
+
+    async def test_a_rescan_leaves_the_list_where_it_was(self) -> None:
+        async with self.app().run_test(size=self.SIZE) as pilot:
+            table = await self.ready(pilot)
+            before = await self.park_mid_screen(pilot, table)
+
+            await pilot.press("r")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertEqual(self.view(table), before)
+
+
+@requires_ffmpeg
+@requires_textual
 class WorkerIsolation(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
     """Background work must not cancel unrelated background work.
 

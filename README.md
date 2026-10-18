@@ -131,6 +131,20 @@ the state worth noticing is a disposition set on a book that cannot be converted
 — forge will defer that book rather than obey blindly. Readiness is computed on
 every refresh, so it can never go stale against the file.
 
+The list keeps its place. An action rebuilds the table, but the cursor stays on
+the row it was on and the list stays scrolled where it was, so marking a run of
+books part-way down a long list moves the view by one row per keystroke rather
+than jumping a screenful each time. The highlighted row is also kept on screen
+when the list gets shorter underneath it — the detail panel grows by a line for
+a book with a blocking reason or a new author, the terminal itself can be
+resized, and at a width where the columns do not fit, the horizontal scrollbar
+is drawn over the list's bottom line. A selected row that is off screen is
+still what the next keystroke acts on, so it is never left there.
+
+The cursor follows the *row*, not the book that was on it: the triage order
+moves a book as soon as it is triaged, so the row under the cursor holds the
+next book to look at.
+
 The bottom row carries two things: `Last action:` on the left, the result of
 whatever you did most recently, and an activity indicator on the right. It reads
 a dim `[Idle]` when nothing is running, and an accented `[⠙ Scanning directory]`,

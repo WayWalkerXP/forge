@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -207,6 +207,57 @@ class ActivityBar(Static):
         self.update(Content(f"[{frame} {self.label}]"))
 
 
+class BookTable(DataTable):
+    """The book list, with one addition: it keeps its cursor on screen.
+
+    textual scrolls the cursor into view whenever the *cursor* moves, but not
+    when the viewport shrinks underneath it - which happens when the terminal
+    is resized, and when the detail panel below grows by a line because the
+    newly selected book has a blocking reason or a new author.  The highlighted
+    row then sat below the bottom edge, under the horizontal scrollbar: still
+    selected, still what the next keystroke would act on, and invisible.
+
+    Neither name here exists on ``DataTable``; both were checked against the
+    MRO, because a method that shadows one of textual's breaks layout with an
+    error that names neither the widget nor the method.
+    """
+
+    def on_resize(self, event: events.Resize) -> None:
+        # After the refresh, not in this handler: the height being measured is
+        # only the new one once the layout has run.
+        self.call_after_refresh(self.keep_cursor_visible)
+
+    def keep_cursor_visible(self, offset: int | None = None) -> None:
+        """Scroll to *offset* - or stay put - without losing the cursor row.
+
+        Preferring the offset the list already had is what keeps the view
+        still after a rebuild; clamping it around the cursor is what keeps the
+        selected row on screen.
+        """
+
+        row = self.cursor_row
+        if not self.row_count or not 0 <= row < self.row_count:
+            return
+
+        # How many *rows* are on screen, which is not the height of the
+        # scrollable region: the header sits inside it and the horizontal
+        # scrollbar is drawn over its last line.  Counting those made the
+        # bottom row look visible while it was behind the scrollbar - the one
+        # place a book could be highlighted, acted on, and never seen.
+        height = self.scrollable_content_region.height - self.fixed_rows
+        if self.show_header:
+            height -= self.header_height
+        height = max(1, height)
+
+        wanted = self.scroll_offset.y if offset is None else offset
+        # The offsets that leave the cursor visible run from "cursor on the
+        # last line" to "cursor on the first".
+        lowest = max(0, row - height + 1)
+        target = max(0, min(min(max(wanted, lowest), row), self.max_scroll_y))
+        if target != self.scroll_offset.y:
+            self.scroll_to(y=target, animate=False)
+
+
 class TriageApp(App[int]):
     """A list of books, and the means to decide what happens to each."""
 
@@ -290,7 +341,7 @@ class TriageApp(App[int]):
         yield Header()
         with Vertical(id="body"):
             yield Input(placeholder="search title, author, series or ASIN", id="search")
-            table = DataTable(id="books", cursor_type="row", zebra_stripes=True)
+            table = BookTable(id="books", cursor_type="row", zebra_stripes=True)
             table.add_columns(
                 "sel", "disposition", "ok", "title", "author", "series", "pt",
                 "asin", "dup", "rate", "notes",
@@ -540,7 +591,17 @@ class TriageApp(App[int]):
         except NoMatches:
             return
 
-        previous = table.cursor_row
+        # What the user was looking at, so the rebuild can put it back: the row
+        # the cursor was on and where the list was scrolled to, which `clear()`
+        # rewinds to the top.
+        #
+        # The row, deliberately, and not the book that was on it.  The triage
+        # order moves a book as soon as it is triaged, so the row the cursor is
+        # on holds the next book to look at - following the old one would send
+        # the cursor chasing it down the list after every keystroke.
+        previous_row = table.cursor_row
+        previous_offset = table.scroll_offset.y
+
         table.clear()
         # Rebuilt from the registry each time, so an identity learned since the
         # last refresh stops being flagged.
@@ -556,8 +617,31 @@ class TriageApp(App[int]):
             table.add_row(*self._row(book), key=book.key)
 
         if self.shown:
-            table.move_cursor(row=min(previous, len(self.shown) - 1))
+            # scroll=False: move_cursor scrolls the row into view, and from the
+            # top of a table `clear()` has just rewound that lands it on the
+            # *last* line of the viewport.  Every action taken part-way down a
+            # long list therefore jumped the list under the cursor, which made
+            # working through one a fight.
+            table.move_cursor(
+                row=max(0, min(previous_row, len(self.shown) - 1)), scroll=False
+            )
         self._refresh_detail()
+        self._keep_cursor_visible(previous_offset)
+
+    def _keep_cursor_visible(self, offset: int | None = None) -> None:
+        """Ask the list to settle at *offset* with the cursor still on screen.
+
+        After the next refresh on purpose.  The detail panel's height follows
+        the selected book - a new author or a blocking reason adds a line - so
+        the table above it has not been resized yet at the point this is asked
+        for, and a height read now is the previous one.
+        """
+
+        try:
+            table = self.query_one("#books", BookTable)
+        except NoMatches:
+            return
+        self.call_after_refresh(table.keep_cursor_visible, offset)
 
     def _row(self, book: Book) -> tuple[str, ...]:
         colour = "red" if book.disposition_conflict else _DISPOSITION_COLOUR[book.disposition]
@@ -706,6 +790,9 @@ class TriageApp(App[int]):
             lines.append(f"  [red]! {escape(error)}[/red]")
 
         panel.update("\n".join(lines))
+        # This panel's height is what shrinks the list above it, so a taller
+        # one must not be able to push the selected row off the bottom.
+        self._keep_cursor_visible()
 
     def _status(self, message: str) -> None:
         # Labelled, because an unlabelled dim line directly under the detail
@@ -762,11 +849,13 @@ class TriageApp(App[int]):
         else:
             self.marked.add(book.key)
 
-        table = self.query_one("#books", DataTable)
-        row = table.cursor_row
         self.refresh_table()
         # Advance, so marking a run of books is one key per book.  Marking the
         # last row leaves the cursor where it is rather than wrapping around.
+        # The row is read back after the refresh, which clamps it to the list
+        # that is actually there now.
+        table = self.query_one("#books", DataTable)
+        row = table.cursor_row
         if row + 1 < len(self.shown):
             table.move_cursor(row=row + 1)
             self._refresh_detail()
