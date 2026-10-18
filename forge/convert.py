@@ -11,6 +11,12 @@ The order of operations is the safety model, and it is deliberate:
 Nothing touches the source until steps 2 and 3 have both succeeded.  Any failure
 deletes the temporary file and leaves the source exactly where it was, so a
 failed run is always safe to simply run again.
+
+A book tagged ``delete`` skips all of it: there is nothing to convert, nothing
+to validate and nothing to archive, so the executor simply removes the files
+the user condemned during triage.  That path is the one place in forge where a
+failure cannot be undone by running again, which is why the checks live in
+:func:`forge.archive.delete_book` rather than here.
 """
 
 from __future__ import annotations
@@ -40,12 +46,14 @@ class Stage(StrEnum):
     PROMOTING = "promoting"
     ARCHIVING = "archiving"
     RELOCATING = "relocating"
+    DELETING = "deleting"
     COMPLETE = "complete"
 
 
 class Outcome(StrEnum):
     CONVERTED = "converted"
     RELOCATED = "relocated"
+    DELETED = "deleted"
     SKIPPED = "skipped"
     FAILED = "failed"
     NEEDS_ATTENTION = "needs-attention"
@@ -65,7 +73,7 @@ class ConversionResult:
 
     @property
     def ok(self) -> bool:
-        return self.outcome in (Outcome.CONVERTED, Outcome.RELOCATED)
+        return self.outcome in (Outcome.CONVERTED, Outcome.RELOCATED, Outcome.DELETED)
 
     @property
     def source_name(self) -> str:
@@ -127,10 +135,56 @@ def execute(
             warnings=list(plan.warnings),
         )
 
+    if plan.disposition is Disposition.DELETE:
+        return _execute_delete(plan, config, emit)
+
     if plan.disposition is Disposition.AS_IS:
         return _execute_as_is(plan, emit)
 
     return _execute_conversion(plan, config, emit)
+
+
+# --------------------------------------------------------------------------- #
+# delete: remove the source
+# --------------------------------------------------------------------------- #
+
+
+def _execute_delete(
+    plan: Plan, config: Config, emit: Callable[..., None]
+) -> ConversionResult:
+    """Throw away a book the user condemned during triage.
+
+    No archive copy and no verification pass, because there is nothing left to
+    verify against: the user's decision *was* that these bytes are not worth
+    keeping.  The source directory is passed in so the deletion can be refused
+    for anything outside it - ``forge run`` takes explicit paths, and a stray
+    ``delete`` tag on a file in the output directory or the library must not be
+    honoured there.
+    """
+
+    what = plan.source_path.name
+    emit(Stage.DELETING, f"deleting {what}")
+
+    try:
+        removed = archive.delete_book(
+            plan.source_path, root=config.source_dir, is_folder=plan.is_folder
+        )
+    except archive.DeletionRefused as exc:
+        LOGGER.error("refused to delete %s: %s", plan.source_path, exc)
+        return ConversionResult(plan=plan, outcome=Outcome.FAILED, message=str(exc))
+    except OSError as exc:
+        # A part-deleted folder is possible here and cannot be undone, so the
+        # message says what was asked for rather than claiming either result.
+        LOGGER.exception("deleting %s failed", plan.source_path)
+        return ConversionResult(
+            plan=plan,
+            outcome=Outcome.FAILED,
+            message=f"could not delete {what}: {exc}",
+        )
+
+    detail = f"deleted {what}" + (f" and its {removed} file(s)" if plan.is_folder else "")
+    emit(Stage.COMPLETE, detail)
+    return ConversionResult(plan=plan, outcome=Outcome.DELETED, message=detail)
 
 
 # --------------------------------------------------------------------------- #

@@ -37,7 +37,13 @@ _DISPOSITION_HELP = {
     Disposition.REMUX: "repackage as m4b without re-encoding the audio",
     Disposition.AS_IS: "already correct; just move it to the output directory",
     Disposition.HOLD: "leave this book alone",
+    Disposition.DELETE: "throw it away on the next run - no archived copy",
 }
+
+#: The key that picks ``delete``.  Deliberately away from 1..5: the numbered
+#: choices all produce a book, and a misread row should not be able to put a
+#: fingertip one key off a disposition that destroys one.
+DELETE_KEY = "9"
 
 
 class DispositionScreen(ModalScreen[Disposition | None]):
@@ -68,6 +74,7 @@ class DispositionScreen(ModalScreen[Disposition | None]):
         Binding("4", "choose(3)", "", show=False),
         Binding("5", "choose(4)", "", show=False),
         Binding("0", "clear", "", show=False),
+        Binding(DELETE_KEY, "choose_delete", "", show=False),
     ]
 
     def __init__(self, book: Any, targets: Sequence[Any] | None = None) -> None:
@@ -115,6 +122,15 @@ class DispositionScreen(ModalScreen[Disposition | None]):
             yield Static(
                 "  [bold]0[/bold]  clear     [dim]back to untriaged[/dim]", classes="choice"
             )
+            # Set apart by the blank line as well as by the key, so that
+            # "the last one in the list" is never delete.
+            yield Static("", classes="choice")
+            delete_marker = "▸" if current is Disposition.DELETE else " "
+            yield Static(
+                f"{delete_marker} [bold red]{DELETE_KEY}[/bold red]  [red]delete[/red]    "
+                f"[dim]{_DISPOSITION_HELP[Disposition.DELETE]}[/dim]",
+                classes="choice",
+            )
 
             blocking = [] if self.batch else self.book.blocking_reasons()
             if blocking:
@@ -125,11 +141,19 @@ class DispositionScreen(ModalScreen[Disposition | None]):
                     id="hint",
                 )
             else:
-                yield Static("press a number, or escape to cancel", id="hint")
+                yield Static(
+                    f"press a number, {DELETE_KEY} to delete, or escape to cancel",
+                    id="hint",
+                )
 
     def action_choose(self, index: int) -> None:
         if 0 <= index < len(ASSIGNABLE):
             self.dismiss(ASSIGNABLE[index])
+
+    def action_choose_delete(self) -> None:
+        # Off the numbered path, and the app asks for confirmation before the
+        # tag is written even for a single book.
+        self.dismiss(Disposition.DELETE)
 
     def action_clear(self) -> None:
         self.dismiss(Disposition.UNTRIAGED)

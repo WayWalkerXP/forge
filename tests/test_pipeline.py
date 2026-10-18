@@ -317,6 +317,102 @@ class AsIs(PipelineCase):
         self.assertTrue(all(f.exists() for f in files))
 
 
+class Delete(PipelineCase):
+    """The one disposition with no undo, so the one worth testing hardest.
+
+    Marking a book costs nothing; the run is where the files go.  These tests
+    pin both halves of that: a dry run must not touch anything, and the real
+    run must take the whole folder rather than only the first track.
+    """
+
+    def test_a_single_file_is_deleted_and_nothing_is_produced(self) -> None:
+        path = self.add_book(
+            "rubbish.m4b", disposition=D.DELETE,
+            metadata={"author": "A", "album": "B"}, seconds=2,
+        )
+
+        item, result = self.run_one(path)
+
+        self.assertIs(item.status, PlanStatus.PLANNED)
+        self.assertEqual(result.outcome, Outcome.DELETED)
+        self.assertFalse(path.exists())
+        self.assertEqual(list(self.cfg.output_dir.iterdir()), [])
+        self.assertEqual(
+            list(self.cfg.archive_dir.iterdir()), [],
+            "a deleted book is not archived; that is the whole point of the value",
+        )
+
+    def test_a_dry_run_deletes_nothing(self) -> None:
+        path = self.add_book(
+            "rubbish.m4b", disposition=D.DELETE,
+            metadata={"author": "A", "album": "B"}, seconds=2,
+        )
+
+        _, result = self.run_one(path, dry_run=True)
+
+        self.assertEqual(result.outcome, Outcome.SKIPPED)
+        self.assertIn("delete", result.message)
+        self.assertTrue(path.exists())
+
+    def test_a_book_with_no_tags_at_all_can_still_be_deleted(self) -> None:
+        # The junk this disposition exists for is exactly the badly tagged
+        # rip that would be INVALID on naming grounds if it were converted.
+        path = self.add_book("rubbish.m4b", disposition=D.DELETE, seconds=2)
+
+        item, result = self.run_one(path)
+
+        self.assertIs(item.status, PlanStatus.PLANNED)
+        self.assertEqual(result.outcome, Outcome.DELETED)
+        self.assertFalse(path.exists())
+
+    def test_a_folder_takes_every_track_and_the_folder(self) -> None:
+        folder = self.cfg.source_dir / "A Bad Rip"
+        files = [folder / f"0{i}.mp3" for i in (1, 2, 3)]
+        for path in files:
+            copy_mp3(path, seconds=1)
+            tags.write_metadata(path, {"author": "A", "album": "B"})
+        (folder / "cover.jpg").write_bytes(b"art")
+        d.write_folder(files, D.DELETE)
+
+        results = self.run_all()
+
+        self.assertEqual([r.outcome for r in results], [Outcome.DELETED])
+        self.assertFalse(folder.exists())
+        self.assertTrue(self.cfg.source_dir.is_dir())
+
+    def test_a_conflicted_folder_is_never_deleted(self) -> None:
+        # Unanimity matters most here: one track tagged delete must not take
+        # the other two with it.
+        folder = self.cfg.source_dir / "A Bad Rip"
+        files = [folder / f"0{i}.mp3" for i in (1, 2)]
+        for path in files:
+            copy_mp3(path, seconds=1)
+            tags.write_metadata(path, {"author": "A", "album": "B"})
+        d.write(files[0], D.DELETE)
+        d.write(files[1], D.DOWNCODE)
+
+        results = self.run_all()
+
+        self.assertEqual(results[0].outcome, Outcome.NEEDS_ATTENTION)
+        self.assertTrue(all(f.exists() for f in files))
+
+    def test_a_delete_tag_outside_the_source_directory_is_refused(self) -> None:
+        # `forge run` takes explicit paths, so a book carrying the tag can be
+        # handed to it from anywhere - including the library.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        path = elsewhere / "shelved.m4b"
+        helpers.copy_audio(path, seconds=2)
+        tags.write_metadata(path, {"author": "A", "album": "B"})
+        d.write(path, D.DELETE)
+
+        _, result = self.run_one(path)
+
+        self.assertEqual(result.outcome, Outcome.FAILED)
+        self.assertIn("source directory", result.message)
+        self.assertTrue(path.exists())
+
+
 class FolderBooks(PipelineCase):
     def make_folder(self, disposition=D.DOWNCODE, tracks=3):
         folder = self.cfg.source_dir / "Odd Thomas"

@@ -157,3 +157,44 @@ class RichOutput(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeletePlans(unittest.TestCase):
+    """A deletion has no encoding target, and must not read like a refusal.
+
+    ``Target.__str__`` prefixes an empty target with "declined:", which for a
+    book tagged ``delete`` would say the opposite of what is about to happen.
+    """
+
+    def plan(self, *, is_folder: bool = False):
+        from forge.disposition import Disposition
+        from forge.plan import Plan, PlanStatus
+        from forge.rules import Target
+
+        files = (Path("/src/junk/01.mp3"), Path("/src/junk/02.mp3"))
+        return Plan(
+            book_key="junk",
+            source_path=Path("/src/junk") if is_folder else Path("/src/junk.m4b"),
+            input_paths=files if is_folder else (Path("/src/junk.m4b"),),
+            is_folder=is_folder,
+            disposition=Disposition.DELETE,
+            status=PlanStatus.PLANNED,
+            target=Target(None, None, "tagged for deletion, so nothing is encoded"),
+        )
+
+    def test_the_summary_says_the_source_goes(self) -> None:
+        self.assertEqual(self.plan().target_summary, "the source will be deleted")
+        self.assertNotIn("declined", self.plan().target_summary)
+
+    def test_the_description_names_the_file(self) -> None:
+        self.assertEqual(self.plan().describe(), "delete junk.m4b")
+
+    def test_a_folder_description_says_how_many_tracks(self) -> None:
+        self.assertIn("2 track(s)", self.plan(is_folder=True).describe())
+
+    def test_the_plain_opening_line_does_not_say_declined(self) -> None:
+        buffer = io.StringIO()
+        render.PlainRenderer(stream=buffer).start_book(self.plan(), 1, 1)
+        output = buffer.getvalue()
+        self.assertIn("delete", output)
+        self.assertNotIn("declined", output)

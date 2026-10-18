@@ -58,6 +58,7 @@ _DISPOSITION_COLOUR = {
     Disposition.REMUX: "blue",
     Disposition.AS_IS: "green",
     Disposition.HOLD: "dim",
+    Disposition.DELETE: "red",
     Disposition.NEEDS_ATTENTION: "yellow",
     Disposition.DONE: "dim",
 }
@@ -661,7 +662,15 @@ class TriageApp(App[int]):
             if meta.genres:
                 lines.append(f"  {escape(', '.join(meta.genres[:4]))}")
 
-        if book.info is not None and book.disposition.is_actionable:
+        if book.disposition.destroys:
+            # No encoding preview, because there will be no encoding: say what
+            # the next run will actually do instead.
+            lines.append(
+                "  [red]→ the next run deletes "
+                + ("this folder and everything in it" if book.is_folder else "this file")
+                + "[/red]"
+            )
+        elif book.info is not None and book.disposition.is_actionable:
             from ..rules import decide
 
             target = decide(
@@ -807,7 +816,10 @@ class TriageApp(App[int]):
         def apply(chosen: Disposition | None) -> None:
             if chosen is None:
                 return
-            if len(targets) == 1:
+            # delete asks even for one book: it is the only disposition whose
+            # execution cannot be undone, so one keystroke should not be the
+            # whole of the decision.
+            if len(targets) == 1 and not chosen.destroys:
                 self._write_disposition(targets[0], chosen)
             else:
                 self._confirm_batch(targets, chosen)
@@ -824,11 +836,12 @@ class TriageApp(App[int]):
             self._confirm_batch(targets, Disposition.UNTRIAGED)
 
     def _confirm_batch(self, books: list[Book], value: Disposition) -> None:
-        """Ask before writing to more than one book.
+        """Ask before writing to more than one book, or before any delete.
 
         A batch write is one keystroke away from an accidental `M`, and it
         touches files rather than a database, so it is the one disposition path
-        that stops to ask.
+        that stops to ask - along with `delete`, however few books it is going
+        to, because that is the one value the run cannot take back.
         """
 
         shown = [escape(book.display_name) for book in books[:6]]
@@ -836,15 +849,22 @@ class TriageApp(App[int]):
         if len(books) > 6:
             detail += f"; and {len(books) - 6} more"
 
+        if value is Disposition.DELETE:
+            noun = "book" if len(books) == 1 else "books"
+            question = f"Delete {len(books)} {noun} on the next run?"
+            # Ahead of the names, because it is the part that is not obvious
+            # from having pressed the key.
+            detail = f"no archived copy; the file(s) go for good — {detail}"
+        else:
+            question = f"Set {len(books)} books to {value.value}?"
+
         def go(confirmed: bool) -> None:
             if confirmed:
                 self._write_dispositions(books, value)
             else:
                 self._status("nothing written")
 
-        self.push_screen(
-            ConfirmScreen(f"Set {len(books)} books to {value.value}?", detail), go
-        )
+        self.push_screen(ConfirmScreen(question, detail), go)
 
     @work(thread=True, group="disposition", exit_on_error=False)
     def _write_disposition(self, book: Book, value: Disposition) -> None:

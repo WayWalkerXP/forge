@@ -480,6 +480,73 @@ class TriageInterface(TempCaseMixin, unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIs(d.read(target.files[0]), D.DOWNCODE)
 
+    async def test_delete_confirms_even_for_a_single_book(self) -> None:
+        # The one disposition the run cannot take back, so the one that is
+        # never a single keystroke.
+        from forge.tui.screens import ConfirmScreen
+
+        async with self.app().run_test() as pilot:
+            await self.wait_for_scan(pilot)
+            target = pilot.app.shown[0]
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.press("9")
+            await pilot.pause()
+
+            self.assertIsInstance(pilot.app.screen, ConfirmScreen)
+            self.assertIs(d.read(target.files[0]), D.UNTRIAGED, "nothing written yet")
+
+            await pilot.press("y")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertIs(d.read(target.files[0]), D.DELETE)
+            self.assertIs(target.disposition, D.DELETE)
+
+    async def test_declining_the_delete_confirmation_writes_nothing(self) -> None:
+        async with self.app().run_test() as pilot:
+            await self.wait_for_scan(pilot)
+            target = pilot.app.shown[0]
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.press("9")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertIs(d.read(target.files[0]), D.UNTRIAGED)
+
+    async def test_no_digit_but_the_delete_key_can_condemn_a_book(self) -> None:
+        # The gap is the feature: the numbered choices all produce a book, and
+        # no slip onto a neighbouring digit may reach the one that destroys
+        # one.  Pressed rather than inspected, because a new binding and a new
+        # entry in ASSIGNABLE are two separate ways to close the gap.
+        from forge.tui.screens import ConfirmScreen, DELETE_KEY, DispositionScreen
+
+        async with self.app().run_test() as pilot:
+            await self.wait_for_scan(pilot)
+            target = pilot.app.shown[0]
+
+            for digit in "12345678":
+                if digit == DELETE_KEY:
+                    continue
+                await pilot.press("space")
+                await pilot.pause()
+                self.assertIsInstance(pilot.app.screen, DispositionScreen, digit)
+                await pilot.press(digit)
+                await pilot.app.workers.wait_for_complete()
+                await pilot.pause()
+
+                self.assertNotIsInstance(pilot.app.screen, ConfirmScreen, digit)
+                self.assertIsNot(d.read(target.files[0]), D.DELETE, digit)
+
+                if isinstance(pilot.app.screen, DispositionScreen):
+                    await pilot.press("escape")
+                    await pilot.pause()
+
     async def test_one_marked_book_needs_no_confirmation_either(self) -> None:
         from forge.tui.screens import ConfirmScreen, DispositionScreen
 

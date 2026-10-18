@@ -13,6 +13,11 @@ Three operations, each refusing to overwrite:
     Source -> destination with a hash check before the source is removed.  Used
     by ``as-is``, where the file being moved *is* the product, so there is no
     archived copy to fall back on.
+
+And one that does lose files, on purpose: :func:`delete_book`, for a book the
+user tagged ``delete``.  It is the only code in forge that removes something it
+cannot put back, so it refuses anything it cannot prove is a triage candidate
+inside the source tree.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import DiskSpaceError, ForgeError
+from .errors import BookError, DiskSpaceError, ForgeError
 from .ffmpeg import is_disk_space_error
 from .paths import collision_safe_path
 from .validate import verify_copy
@@ -34,6 +39,14 @@ LOGGER = logging.getLogger(__name__)
 
 class PromotionError(ForgeError):
     """A validated output could not be moved into its final place."""
+
+
+class DeletionRefused(BookError):
+    """A requested deletion could not be proven safe, so nothing was removed.
+
+    A :class:`~forge.errors.BookError` rather than a bare ``ForgeError``: one
+    book forge will not delete must not stop the rest of the night's work.
+    """
 
 
 @dataclass(frozen=True)
@@ -239,3 +252,60 @@ def remove_quietly(path: Path | None) -> None:
         if is_disk_space_error(exc):
             raise DiskSpaceError(str(exc)) from exc
         LOGGER.warning("could not remove %s: %s", path, exc)
+
+
+def delete_book(path: Path, *, root: Path, is_folder: bool) -> int:
+    """Delete a book tagged ``delete``, returning how many files went.
+
+    The whole point of the disposition is that this is not recoverable - the
+    original is not archived, because the user said the book is not worth
+    keeping - so every mistake here is permanent.  Four things are checked
+    first, and any of them failing removes nothing at all:
+
+    *   the path lies *inside* *root*, the directory being triaged.  ``forge
+        run`` accepts explicit paths, and a ``delete`` tag that wandered into
+        the output directory or the library must not be honoured there.
+    *   it is not *root* itself, which a folder book one level up would
+        otherwise take with it.
+    *   it is not a symbolic link, and nothing on the way to it is: resolving
+        first means a link pointing out of the source tree fails the
+        containment check rather than deleting what it points at.
+    *   it is the kind of thing the book says it is, a directory for a folder
+        book and a file for a single-file one.
+
+    A folder book takes its whole directory, which is what triage promises when
+    it says "the folder and everything in it": the cover art, the nfo and the
+    stray ``Thumbs.db`` are exactly the clutter being thrown away.
+    ``shutil.rmtree`` does not follow symlinks inside it - a link is unlinked,
+    never walked - so a folder containing a link into the library loses the
+    link and nothing else.
+    """
+
+    resolved = path.resolve()
+    root_resolved = Path(root).resolve()
+
+    if resolved == root_resolved:
+        raise DeletionRefused(f"refusing to delete the source directory itself: {resolved}")
+    if root_resolved not in resolved.parents:
+        raise DeletionRefused(
+            f"refusing to delete {resolved}: it is not inside the source directory "
+            f"{root_resolved}"
+        )
+    if path.is_symlink():
+        raise DeletionRefused(f"refusing to delete {path}: it is a symbolic link")
+
+    if is_folder:
+        if not resolved.is_dir():
+            raise DeletionRefused(f"refusing to delete {resolved}: not a directory")
+        removed = sum(1 for child in resolved.rglob("*") if child.is_file())
+        shutil.rmtree(resolved)
+    else:
+        if not resolved.is_file():
+            raise DeletionRefused(f"refusing to delete {resolved}: not a regular file")
+        resolved.unlink()
+        removed = 1
+
+    # At warning level deliberately: in cron.log this is the only record that
+    # the files ever existed.
+    LOGGER.warning("deleted %s (%d file(s)) as tagged", resolved, removed)
+    return removed

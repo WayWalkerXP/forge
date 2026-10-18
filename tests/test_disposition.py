@@ -35,7 +35,7 @@ class Parsing(unittest.TestCase):
     def test_unknown_values_become_hold_never_an_action(self) -> None:
         # This is the forward-compatibility guarantee: a tag written by a future
         # version must never make this version do something destructive.
-        for value in ("banana", "downcode_v2", "DELETE", "convert", "0", "yes"):
+        for value in ("banana", "downcode_v2", "erase", "convert", "0", "yes"):
             with self.subTest(value=value):
                 parsed = d.parse(value)
                 self.assertIs(parsed, D.HOLD)
@@ -43,9 +43,9 @@ class Parsing(unittest.TestCase):
 
 
 class Semantics(unittest.TestCase):
-    def test_only_four_dispositions_act(self) -> None:
+    def test_only_five_dispositions_act(self) -> None:
         acting = {m for m in D if m.is_actionable}
-        self.assertEqual(acting, {D.DOWNCODE, D.DRAMA, D.REMUX, D.AS_IS})
+        self.assertEqual(acting, {D.DOWNCODE, D.DRAMA, D.REMUX, D.AS_IS, D.DELETE})
 
     def test_untriaged_never_acts(self) -> None:
         self.assertFalse(D.UNTRIAGED.is_actionable)
@@ -67,10 +67,36 @@ class Semantics(unittest.TestCase):
     def test_as_is_does_not_convert(self) -> None:
         self.assertFalse(D.AS_IS.converts)
 
+    def test_delete_is_read_back_whatever_the_case(self) -> None:
+        # Written by triage in lower case, but a tag edited by hand in MP3Tag
+        # is the usual way a disposition gets shouted.
+        for value in ("delete", "DELETE", " Delete "):
+            with self.subTest(value=value):
+                self.assertIs(d.parse(value), D.DELETE)
+
+    def test_delete_acts_but_neither_converts_nor_re_encodes(self) -> None:
+        self.assertTrue(D.DELETE.is_actionable)
+        self.assertFalse(D.DELETE.converts)
+        self.assertFalse(D.DELETE.re_encodes)
+
+    def test_only_delete_destroys(self) -> None:
+        # The planner and the renderers branch on this rather than on the
+        # member, so a second destructive value would have to opt in here.
+        self.assertEqual({m for m in D if m.destroys}, {D.DELETE})
+
+    def test_delete_is_off_the_numbered_menu_but_still_assignable(self) -> None:
+        # The gap is the safety feature: a numbered choice that deletes books
+        # sits one fingertip away from one that encodes them.
+        self.assertNotIn(D.DELETE, d.ASSIGNABLE)
+        self.assertIn(D.DELETE, d.GUARDED)
+        self.assertIn(D.DELETE, d.SETTABLE)
+
     def test_assignable_excludes_machine_written_values(self) -> None:
         self.assertNotIn(D.NEEDS_ATTENTION, d.ASSIGNABLE)
         self.assertNotIn(D.DONE, d.ASSIGNABLE)
         self.assertNotIn(D.UNTRIAGED, d.ASSIGNABLE)
+        for member in (D.NEEDS_ATTENTION, D.DONE, D.UNTRIAGED):
+            self.assertNotIn(member, d.SETTABLE)
 
 
 @requires_ffmpeg

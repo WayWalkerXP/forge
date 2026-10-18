@@ -22,11 +22,22 @@ Stored as `----:com.apple.iTunes:FORGE_DISPOSITION` (MP4) or
 | `remux` | repackage as m4b without re-encoding the audio | output dir | → archive |
 | `as-is` | already correct; relocate only | output dir | consumed |
 | `hold` | looked at, deliberately left alone | — | untouched |
+| `delete` | not worth keeping; the run throws it away | — | deleted |
 | `needs-attention` | forge tried and could not proceed | — | untouched |
 | `done` | written onto outputs so they are never reprocessed | — | — |
 
 Any value forge does not recognise is treated as `hold`. A tag written by a
 future version can never make an older version do something destructive.
+
+`delete` is the one value with no undo. Nothing is deleted while triage is
+running: the tag can be cleared again right up to the moment `forge run` reads
+it, and then the file goes — for a folder book, the folder and everything in
+it, including the cover art and any other files left in there. There is no
+archived copy, because the decision was that the book is not worth keeping. It
+is the only disposition that is not on the numbered part of the triage menu; it
+is `9`, and triage confirms it even for a single book. A deletion is refused
+outright for anything that is not inside the directory being triaged, so a
+`delete` tag that reaches the output directory or the library does nothing.
 
 Disposition records **intent only**. Bitrate and channels come from the rules at
 conversion time, so retuning the rules applies to every already-triaged book.
@@ -140,6 +151,11 @@ the one under the cursor. The disposition dialog says so (`Set disposition — 7
 marked books`) and, because the choice is one keystroke away from an accidental
 `M`, a batch write stops to confirm and names what it is about to touch. One
 marked book is not a batch: it writes straight away, like `space` always has.
+
+`delete` is the exception: it confirms however few books it is going to, and the
+dialog says that the next run deletes the files with no archived copy. On the
+disposition menu it is not one of the numbered choices at all — it is `9`, with
+a gap above it, so a slip of a fingertip on `5` cannot land on it.
 
 A few details chosen deliberately:
 
@@ -607,9 +623,12 @@ always safe to simply run again.
   A truncated or chapter-stripped output is rejected and discarded.
 - **Nothing is overwritten.** Promotion uses an exclusive create; an existing
   output stops the plan; archive collisions get a `(2)` suffix.
-- **Nothing is deleted.** Originals move to the archive. The only deletion is
-  the source of an `as-is` relocation, and only after a byte-for-byte hash
-  comparison of the copy.
+- **Nothing is deleted** unless you said so. Originals move to the archive. The
+  exceptions are the source of an `as-is` relocation, and only after a
+  byte-for-byte hash comparison of the copy; and a book deliberately tagged
+  `delete`, which is refused unless it is inside the directory being triaged,
+  is not a symbolic link, and is the kind of thing — file or folder — the book
+  was scanned as.
 - **Tags survive the conversion.** ffmpeg's mp4 muxer writes only the atoms it
   knows about, so `-map_metadata` quietly loses every custom one — series,
   series-part, ASIN, subtitle, publisher, language, explicit. forge re-applies

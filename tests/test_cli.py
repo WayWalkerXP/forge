@@ -325,3 +325,55 @@ class ShelveFromTheCommandLine(TempCaseMixin):
         self.assertEqual(status, 0, output)
         shelved = list(self.library.rglob("*.m4b"))
         self.assertEqual(len(shelved), 1, shelved)
+
+
+@requires_ffmpeg
+class SettingDeleteFromTheCommandLine(TempCaseMixin):
+    """`forge disposition -s delete` has to work: cron is not the only caller.
+
+    The TUI guards the value behind its own key and a confirmation, but a
+    value typed out in full has no menu to mis-press, so the CLI accepts it
+    like any other - and must say so when a near miss is typed instead.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.config_path = write_config(self.root)
+        self.cfg = config_mod.load(self.config_path)
+        self.book = self.cfg.source_dir / "junk.m4b"
+        helpers.copy_audio(self.book, seconds=1)
+
+    def run_cli(self, *argv: str) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            status = main(["-c", str(self.config_path), *argv])
+        return status, buffer.getvalue()
+
+    def test_delete_is_accepted_and_written(self) -> None:
+        from forge import disposition as d
+        from forge.disposition import Disposition as D
+
+        status, output = self.run_cli("disposition", str(self.book), "-s", "delete")
+
+        self.assertEqual(status, 0)
+        self.assertIn("delete", output)
+        self.assertIs(d.read(self.book), D.DELETE)
+
+    def test_the_tag_can_still_be_cleared_again(self) -> None:
+        from forge import disposition as d
+        from forge.disposition import Disposition as D
+
+        self.run_cli("disposition", str(self.book), "-s", "delete")
+        self.run_cli("disposition", str(self.book), "-s", "clear")
+        self.assertIs(d.read(self.book), D.UNTRIAGED)
+
+    def test_a_near_miss_is_rejected_rather_than_guessed_at(self) -> None:
+        from forge import disposition as d
+        from forge.disposition import Disposition as D
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            status = main(["-c", str(self.config_path), "disposition", str(self.book), "-s", "erase"])
+
+        self.assertEqual(status, 2)
+        self.assertIs(d.read(self.book), D.UNTRIAGED)

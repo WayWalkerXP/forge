@@ -23,6 +23,7 @@ from .scan import Book
 _OUTCOME_STYLE = {
     Outcome.CONVERTED: ("✓", "green"),
     Outcome.RELOCATED: ("→", "green"),
+    Outcome.DELETED: ("×", "red"),
     Outcome.SKIPPED: ("·", "dim"),
     Outcome.NEEDS_ATTENTION: ("!", "yellow"),
     Outcome.FAILED: ("✗", "red"),
@@ -35,6 +36,7 @@ _DISPOSITION_STYLE = {
     Disposition.REMUX: "blue",
     Disposition.AS_IS: "green",
     Disposition.HOLD: "dim",
+    Disposition.DELETE: "red",
     Disposition.NEEDS_ATTENTION: "yellow",
     Disposition.DONE: "dim",
 }
@@ -151,7 +153,7 @@ class PlainRenderer:
         self._write(
             "info",
             f"[{index}/{total}] {plan.source_path.name}: {plan.disposition.value} "
-            f"-> {plan.target}",
+            f"-> {plan.target_summary}",
         )
 
     def stage(self, event: StageEvent) -> None:
@@ -292,10 +294,17 @@ class RichRenderer:
             else:
                 style, detail = "yellow", "; ".join(plan.errors)
 
+            # A declined target has nothing to show, but a deletion's "target"
+            # is the deletion itself, which is worth the column.
+            if plan.disposition.destroys:
+                target = plan.target_summary
+            else:
+                target = "" if plan.target.declined else str(plan.target)
+
             table.add_row(
                 _plain(plan.source_path.name),
                 f"[{style}]{plan.disposition.value}[/{style}]",
-                "" if plan.target.declined else str(plan.target),
+                target,
                 _plain(plan.output_path.name) if plan.output_path else "[dim]—[/dim]",
                 _plain(detail),
             )
@@ -313,7 +322,7 @@ class RichRenderer:
 
         self.console.print(
             f"[bold]\\[{index}/{total}][/bold] {_plain(plan.source_path.name)} "
-            f"[dim]{plan.disposition.value} → {plan.target}[/dim]"
+            f"[dim]{plan.disposition.value} → {plan.target_summary}[/dim]"
         )
         self._progress = Progress(
             TextColumn("  {task.description}"),

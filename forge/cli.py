@@ -5,7 +5,8 @@ Subcommands:
 ``triage``
     The interactive TUI.  Reads, edits and tags; never converts.
 ``run``
-    The executor.  Reads disposition tags and acts.  Takes explicit paths for
+    The executor.  Reads disposition tags and acts: converts, relocates, or -
+    for a book tagged ``delete`` - removes it.  Takes explicit paths for
     converting one book on demand, or no paths at all for the cron entry point.
 ``shelve``
     The last step: files finished books into the Audiobookshelf library.
@@ -106,7 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
         "so this is how an intermittent problem gets captured",
     )
 
-    run = sub.add_parser("run", help="convert books according to their disposition tag", parents=[shared])
+    run = sub.add_parser(
+        "run",
+        help="convert books according to their disposition tag",
+        description="Acts on every book whose disposition says to: converts it, "
+        "relocates it, or deletes it when triage tagged it 'delete'.",
+        parents=[shared],
+    )
     run.add_argument(
         "paths",
         nargs="*",
@@ -224,7 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
     disp = sub.add_parser("disposition", help="read or set the disposition tag", parents=[shared])
     disp.add_argument("paths", nargs="+", type=Path)
     disp.add_argument(
-        "-s", "--set", dest="value", help="downcode, drama, remux, as-is, hold, or clear"
+        "-s", "--set", dest="value",
+        help="downcode, drama, remux, as-is, hold, delete, or clear",
     )
 
     lookup = sub.add_parser("lookup", help="query Audible", parents=[shared])
@@ -1025,7 +1033,7 @@ def cmd_disposition(args: argparse.Namespace) -> int:
         if target is Disposition.HOLD and raw != "hold":
             print(
                 f"unknown disposition {args.value!r}; choose from "
-                f"{', '.join(d.value for d in disposition_mod.ASSIGNABLE)}, or 'clear'",
+                f"{', '.join(d.value for d in disposition_mod.SETTABLE)}, or 'clear'",
                 file=sys.stderr,
             )
             return EXIT_USAGE

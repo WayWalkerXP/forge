@@ -148,3 +148,113 @@ class VerifiedRelocation(TempCaseMixin):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Deletion(TempCaseMixin):
+    """`delete_book` is the only thing in forge that cannot be undone.
+
+    Every test here is about something it must *refuse*: the guards are the
+    feature, and a regression in one of them loses a book that was never meant
+    to be deleted.
+    """
+
+    def test_a_single_file_inside_the_root_goes(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        book = source / "junk.m4b"
+        book.write_bytes(b"junk")
+
+        removed = archive.delete_book(book, root=source, is_folder=False)
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(book.exists())
+
+    def test_a_folder_takes_everything_in_it(self) -> None:
+        source = self.root / "source"
+        folder = source / "A Book"
+        folder.mkdir(parents=True)
+        (folder / "01.mp3").write_bytes(b"one")
+        (folder / "02.mp3").write_bytes(b"two")
+        (folder / "cover.jpg").write_bytes(b"art")
+        (folder / "extras").mkdir()
+        (folder / "extras" / "notes.nfo").write_bytes(b"nfo")
+
+        removed = archive.delete_book(folder, root=source, is_folder=True)
+
+        self.assertEqual(removed, 4, "the cover and the nfo count too")
+        self.assertFalse(folder.exists())
+        self.assertTrue(source.is_dir(), "the source directory itself survives")
+
+    def test_a_path_outside_the_root_is_refused(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        elsewhere = self.root / "library" / "book.m4b"
+        elsewhere.parent.mkdir()
+        elsewhere.write_bytes(b"shelved")
+
+        with self.assertRaises(archive.DeletionRefused):
+            archive.delete_book(elsewhere, root=source, is_folder=False)
+
+        self.assertTrue(elsewhere.exists())
+
+    def test_the_root_itself_is_refused(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        (source / "book.m4b").write_bytes(b"keep")
+
+        with self.assertRaises(archive.DeletionRefused):
+            archive.delete_book(source, root=source, is_folder=True)
+
+        self.assertTrue((source / "book.m4b").exists())
+
+    def test_a_symlink_out_of_the_root_is_refused(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        real = self.root / "library" / "book.m4b"
+        real.parent.mkdir()
+        real.write_bytes(b"shelved")
+        link = source / "book.m4b"
+        link.symlink_to(real)
+
+        with self.assertRaises(archive.DeletionRefused):
+            archive.delete_book(link, root=source, is_folder=False)
+
+        self.assertTrue(real.exists(), "the file the link pointed at must survive")
+        self.assertTrue(link.is_symlink(), "and so must the link")
+
+    def test_a_link_inside_a_deleted_folder_is_unlinked_not_followed(self) -> None:
+        source = self.root / "source"
+        folder = source / "A Book"
+        folder.mkdir(parents=True)
+        (folder / "01.mp3").write_bytes(b"one")
+        real = self.root / "library" / "keep.m4b"
+        real.parent.mkdir()
+        real.write_bytes(b"shelved")
+        (folder / "shortcut.m4b").symlink_to(real)
+
+        archive.delete_book(folder, root=source, is_folder=True)
+
+        self.assertFalse(folder.exists())
+        self.assertTrue(real.exists())
+
+    def test_a_folder_book_whose_path_is_a_file_is_refused(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        book = source / "book.m4b"
+        book.write_bytes(b"one file")
+
+        with self.assertRaises(archive.DeletionRefused):
+            archive.delete_book(book, root=source, is_folder=True)
+
+        self.assertTrue(book.exists())
+
+    def test_a_single_file_book_that_is_a_directory_is_refused(self) -> None:
+        source = self.root / "source"
+        folder = source / "A Book"
+        folder.mkdir(parents=True)
+        (folder / "01.mp3").write_bytes(b"one")
+
+        with self.assertRaises(archive.DeletionRefused):
+            archive.delete_book(folder, root=source, is_folder=False)
+
+        self.assertTrue((folder / "01.mp3").exists())

@@ -14,6 +14,11 @@ Three rules govern everything here:
 3.  **Intent only.**  A disposition records *what* should happen, not the
     parameters.  Bitrate and channels are computed from the rules at conversion
     time, so retuning the rules applies to every already-triaged book.
+
+:data:`Disposition.DELETE` is the one value that destroys something, and it
+obeys the same three rules: nothing is deleted while triage is running, the tag
+can be cleared again right up to the moment the run reads it, and a version of
+forge that predates the value treats it as ``hold``.
 """
 
 from __future__ import annotations
@@ -53,6 +58,15 @@ class Disposition(StrEnum):
     HOLD = "hold"
     """Looked at, deliberately left alone."""
 
+    DELETE = "delete"
+    """Throw this book away: the file, or the folder and everything in it.
+
+    The one disposition with no undo.  Marking a book costs nothing - the tag
+    is as reversible as any other - but the next ``forge run`` removes the
+    files outright, with no archived copy behind them, which is why it is kept
+    off the numbered part of the triage menu.
+    """
+
     NEEDS_ATTENTION = "needs-attention"
     """forge tried and could not proceed.  Written by the executor."""
 
@@ -64,6 +78,17 @@ class Disposition(StrEnum):
         """True when ``forge run`` should act on a book carrying this value."""
 
         return self in _ACTIONABLE
+
+    @property
+    def destroys(self) -> bool:
+        """True when acting on this disposition removes files for good.
+
+        Callers that reason about "what will this run produce" need to tell a
+        book being converted from one being thrown away: there is no target
+        bitrate, no output name and no archive copy for a deletion.
+        """
+
+        return self is Disposition.DELETE
 
     @property
     def converts(self) -> bool:
@@ -90,10 +115,14 @@ _ACTIONABLE = frozenset(
         Disposition.DRAMA,
         Disposition.REMUX,
         Disposition.AS_IS,
+        Disposition.DELETE,
     }
 )
 
-#: Values a user may assign during triage, in menu order.
+#: Values a user may assign during triage, in menu order.  The triage menu
+#: numbers these 1..n, so :data:`Disposition.DELETE` is deliberately not here:
+#: a value that deletes files should not be one key away from one that encodes
+#: them.
 ASSIGNABLE: tuple[Disposition, ...] = (
     Disposition.DOWNCODE,
     Disposition.DRAMA,
@@ -101,6 +130,15 @@ ASSIGNABLE: tuple[Disposition, ...] = (
     Disposition.AS_IS,
     Disposition.HOLD,
 )
+
+#: Assignable, but held back from the numbered menu and reached by a key of
+#: its own.  Separate rather than simply last, because "the fifth choice" is a
+#: slip away from "the sixth".
+GUARDED: tuple[Disposition, ...] = (Disposition.DELETE,)
+
+#: Everything a user may assign, for the non-interactive paths that accept a
+#: value typed out in full and have no menu to mis-press.
+SETTABLE: tuple[Disposition, ...] = ASSIGNABLE + GUARDED
 
 _BY_VALUE = {str(member).casefold(): member for member in Disposition}
 #: Spellings accepted on read so a hand-typed tag still works.

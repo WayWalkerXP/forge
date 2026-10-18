@@ -12,9 +12,9 @@ Three outcomes, and the distinction matters for what the executor does next:
     A deliberate, non-error decision - the rules declined the source, or the
     disposition is not one that acts.  Nothing is wrong.
 ``INVALID``
-    The disposition says to convert but the book cannot be converted as it
-    stands.  This is the case that becomes ``needs-attention``: forge was told
-    to do something it cannot do, and a human needs to look.
+    The disposition says to act but the book cannot be acted on as it stands.
+    This is the case that becomes ``needs-attention``: forge was told to do
+    something it cannot do, and a human needs to look.
 """
 
 from __future__ import annotations
@@ -87,6 +87,19 @@ class Plan:
         return self.status is PlanStatus.INVALID
 
     @property
+    def target_summary(self) -> str:
+        """The target as a renderer should print it.
+
+        ``delete`` has no encoding target, and showing the empty one through
+        ``Target.__str__`` would print "declined: ..." - which reads as forge
+        refusing the book rather than as the whole point of the disposition.
+        """
+
+        if self.disposition.destroys:
+            return "the source will be deleted"
+        return str(self.target)
+
+    @property
     def estimated_output_bytes(self) -> int:
         if self.source_info is None:
             return 0
@@ -100,6 +113,9 @@ class Plan:
 
         name = self.output_path.name if self.output_path else self.source_path.name
         if self.status is PlanStatus.PLANNED:
+            if self.disposition.destroys:
+                files = "" if not self.is_folder else f" and its {len(self.input_paths)} track(s)"
+                return f"delete {self.source_path.name}{files}"
             return f"{self.disposition} -> {name} ({self.target})"
         reason = "; ".join(self.errors or self.warnings) or self.target.rationale
         return f"{self.status}: {reason}"
@@ -151,6 +167,17 @@ def plan(book: Book, config: Config, *, codec: str | None = None) -> Plan:
     if not book.files:
         errors.append("no audio files found")
         return result(PlanStatus.INVALID, target=rules.Target(None, None, "no input files"))
+
+    if disposition is Disposition.DELETE:
+        # Nothing below this point applies: there is no bitrate to decide, no
+        # name to render and no archive copy to file.  Returning here is also
+        # what makes the junk this disposition exists for deletable at all - a
+        # rip with no author tag would be INVALID on naming grounds, and
+        # demanding tags from a file on its way to the bin is backwards.
+        return result(
+            PlanStatus.PLANNED,
+            target=rules.Target(None, None, "tagged for deletion, so nothing is encoded"),
+        )
 
     if disposition is Disposition.AS_IS and book.is_folder:
         # "as-is" means this file is already the finished product.  A directory
